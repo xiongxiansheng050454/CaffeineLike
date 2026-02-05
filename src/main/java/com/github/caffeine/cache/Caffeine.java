@@ -1,4 +1,4 @@
-package com.github.benmanes.caffeine.cache;
+package com.github.caffeine.cache;
 
 import java.util.concurrent.TimeUnit;
 

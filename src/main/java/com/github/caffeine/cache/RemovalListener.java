@@ -1,4 +1,4 @@
-package com.github.benmanes.caffeine.cache;
+package com.github.caffeine.cache;
 
 @FunctionalInterface
 public interface RemovalListener<K, V> {

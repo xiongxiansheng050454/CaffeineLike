@@ -1,4 +1,4 @@
-package com.github.benmanes.caffeine.cache;
+package com.github.caffeine.cache;
 
 public final class CacheStats {
     private final long hitCount;
