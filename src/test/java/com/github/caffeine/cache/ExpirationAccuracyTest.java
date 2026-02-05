@@ -67,7 +67,7 @@ public class ExpirationAccuracyTest {
                         .expireAfterWrite(50, TimeUnit.MILLISECONDS)
                         .build();
 
-        // 阶段1：并发写入
+        // 阶段1：并发写入（覆盖写入会重置过期时间）
         Runnable writeTask = () -> {
             for (int i = 0; i < 10; i++) {
                 cache.put("key" + (i % 5), "value" + i);
@@ -80,22 +80,23 @@ public class ExpirationAccuracyTest {
         t1.start(); t2.start();
         t1.join(); t2.join();
 
-        // 阶段2：等待过期（关键：停止写入，让时间流逝）
-        Thread.sleep(100);  // 超过 50ms 过期时间
+        // 阶段2：等待过期（必须超过最后一次写入时间50ms以上）
+        // 最后一次写入约在 t=45ms（9*5），所以等待100ms确保过期
+        Thread.sleep(100);
 
-        // 阶段3：验证过期
-        AtomicInteger misses = new AtomicInteger();
-        Runnable readTask = () -> {
-            for (int i = 0; i < 5; i++) {
-                if (cache.getIfPresent("key" + i) == null) {
-                    misses.incrementAndGet();
-                }
+        // 阶段3：主线程直接验证（触发惰性清理）
+        int misses = 0;
+        for (int i = 0; i < 5; i++) {
+            if (cache.getIfPresent("key" + i) == null) {
+                misses++;
             }
-        };
+        }
 
-        new Thread(readTask).start();
-        // 或者直接用主线程读
-        assertTrue(misses.get() > 0 || cache.stats().expireCount() > 0, "数据应已过期");
+        // 只要有一个key过期即通过（可能部分key在写入时刚好被覆盖，时间戳最新）
+        assertTrue(misses > 0, "至少部分数据应已过期，实际misses=" + misses);
+
+        // 统计信息验证（可选，因为时间轮粒度问题可能延迟）
+        System.out.println("Expire count: " + cache.stats().expireCount());
 
         cache.shutdown();
     }

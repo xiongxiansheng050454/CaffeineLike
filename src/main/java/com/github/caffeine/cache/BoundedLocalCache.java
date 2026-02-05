@@ -1,12 +1,16 @@
 package com.github.caffeine.cache;
 
+import com.github.caffeine.CacheUtils;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.LongAdder;
 
 public class BoundedLocalCache<K, V> implements Cache<K, V> {
-    private final ConcurrentHashMap<K, Node<K, V>> data;
+    // 分片架构替代单ConcurrentHashMap
+    private final LocalCacheSegment<K, V>[] segments;
+    private final int segmentMask;
+
     private final Caffeine<K, V> builder;
     private final HierarchicalTimerWheel<K, V> timerWheel;
 
@@ -14,33 +18,61 @@ public class BoundedLocalCache<K, V> implements Cache<K, V> {
     private final LongAdder missCount = new LongAdder();
     private final LongAdder expireCount = new LongAdder();
 
+    @SuppressWarnings("unchecked")
     public BoundedLocalCache(Caffeine<K, V> builder) {
         this.builder = builder;
-        int capacity = builder.initialCapacity > 0 ? builder.initialCapacity : 16;
-        this.data = new ConcurrentHashMap<>(capacity);
 
+        // 计算分片数：基于并发级别（默认CPU核心数）
+        int concurrencyLevel = Runtime.getRuntime().availableProcessors();
+        int segmentCount = CacheUtils.tableSizeFor(concurrencyLevel);
+        this.segmentMask = segmentCount - 1;
+
+        // 计算单分片容量
+        int totalCapacity = builder.initialCapacity > 0 ? builder.initialCapacity : 16;
+        int segmentCapacity = Math.max(1, totalCapacity / segmentCount);
+
+        // 初始化分片数组
+        this.segments = new LocalCacheSegment[segmentCount];
+        for (int i = 0; i < segmentCount; i++) {
+            segments[i] = new LocalCacheSegment<>(segmentCapacity);
+        }
+
+        // 初始化时间轮（全局唯一，与分片无关）
         if (builder.expiresAfterWrite() || builder.expiresAfterAccess()) {
             this.timerWheel = new HierarchicalTimerWheel<>(this::onTimerExpired);
         } else {
             this.timerWheel = null;
         }
+
+        System.out.println("Initialized sharded cache: " + segmentCount +
+                " segments, mask=0x" + Integer.toHexString(segmentMask));
+    }
+
+    /**
+     * 哈希定位：找到key对应的分片（核心优化点，O(1)定位）
+     */
+    private LocalCacheSegment<K, V> segmentFor(K key) {
+        int hash = CacheUtils.spread(key.hashCode());
+        // 位运算替代取模：hash % segmentCount == hash & (segmentCount - 1)
+        return segments[hash & segmentMask];
     }
 
     @Override
     public V getIfPresent(K key) {
-        Node<K, V> node = data.get(key);
+        LocalCacheSegment<K, V> segment = segmentFor(key);
+        Node<K, V> node = segment.getNode(key);
+
         if (node == null) {
             missCount.increment();
             return null;
         }
 
-        // 统一使用毫秒
         long now = System.currentTimeMillis();
 
         if (isExpired(node, now)) {
-            if (data.remove(key, node)) {
+            // 使用removeNode确保原子性（compare-and-remove）
+            if (segment.removeNode(key, node)) {
                 expireCount.increment();
-                // 从时间轮移除（同步块保护）
                 if (timerWheel != null) {
                     synchronized (node) {
                         timerWheel.cancel(node);
@@ -65,19 +97,20 @@ public class BoundedLocalCache<K, V> implements Cache<K, V> {
 
     @Override
     public void put(K key, V value) {
-        // 统一使用毫秒
+        LocalCacheSegment<K, V> segment = segmentFor(key);
         long now = System.currentTimeMillis();
         long expireAt = calculateExpireAt(now);
 
         Node<K, V> newNode = new Node<>(key, value, now, expireAt);
 
-        // 注意：测试未设置maximumSize，不会触发驱逐
-        if (builder.evicts() && builder.maximumSize > 0 && data.size() >= builder.maximumSize) {
-            // 简化策略：不插入（生产环境应使用W-TinyLFU）
+        // 注意：最大容量检查现在是基于全局size的近似值，或需要遍历所有segment
+        // 简化策略：这里使用全局size检查，实际Caffeine会在每个segment独立触发驱逐
+        if (builder.evicts() && builder.maximumSize > 0 && estimatedSize() >= builder.maximumSize) {
+            // TODO: 实现W-TinyLFU淘汰，此处暂时跳过插入或简单淘汰
             return;
         }
 
-        Node<K, V> oldNode = data.put(key, newNode);
+        Node<K, V> oldNode = segment.putNode(key, newNode);
 
         if (timerWheel != null) {
             if (oldNode != null) {
@@ -96,7 +129,8 @@ public class BoundedLocalCache<K, V> implements Cache<K, V> {
 
     @Override
     public void invalidate(K key) {
-        Node<K, V> node = data.remove(key);
+        LocalCacheSegment<K, V> segment = segmentFor(key);
+        Node<K, V> node = segment.removeNode(key);
         if (node != null && timerWheel != null) {
             synchronized (node) {
                 timerWheel.cancel(node);
@@ -106,19 +140,20 @@ public class BoundedLocalCache<K, V> implements Cache<K, V> {
 
     /**
      * 时间轮回调：Key过期触发
+     * 注意：过期时需要通过key重新定位segment，因为Node不持有segment引用
      */
     private void onTimerExpired(K key) {
-        Node<K, V> node = data.get(key);
+        LocalCacheSegment<K, V> segment = segmentFor(key);
+        Node<K, V> node = segment.getNode(key);
         if (node == null) return;
 
-        // 关键修复：必须使用System.currentTimeMillis()，与expireAt的基准一致
         long now = System.currentTimeMillis();
         if (isExpired(node, now)) {
-            if (data.remove(key, node)) {
+            // 使用removeNode确保原子性（只有当node未被替换时才删除）
+            if (segment.removeNode(key, node)) {
                 expireCount.increment();
             }
         }
-        // 否则说明已被reschedule或已访问续约，忽略
     }
 
     private boolean isExpired(Node<K, V> node, long now) {
@@ -127,7 +162,6 @@ public class BoundedLocalCache<K, V> implements Cache<K, V> {
         return now >= expireAt;
     }
 
-    // 修正：使用毫秒计算过期时间
     private long calculateExpireAt(long now) {
         long minExpire = Long.MAX_VALUE;
 
@@ -158,30 +192,41 @@ public class BoundedLocalCache<K, V> implements Cache<K, V> {
 
     @Override
     public void invalidateAll() {
-        data.values().forEach(node -> {
-            if (timerWheel != null) {
-                synchronized (node) {
-                    timerWheel.cancel(node);
+        // 遍历所有分片执行clear
+        for (LocalCacheSegment<K, V> segment : segments) {
+            segment.getMap().values().forEach(node -> {
+                if (timerWheel != null) {
+                    synchronized (node) {
+                        timerWheel.cancel(node);
+                    }
                 }
-            }
-        });
-        data.clear();
+            });
+            segment.getMap().clear();
+        }
     }
 
     @Override
     public long estimatedSize() {
-        return data.size();
+        long sum = 0;
+        for (LocalCacheSegment<K, V> seg : segments) {
+            sum += seg.size();
+        }
+        return sum;
     }
 
     @Override
     public ConcurrentMap<K, V> asMap() {
         ConcurrentHashMap<K, V> map = new ConcurrentHashMap<>();
-        long now = System.nanoTime();
-        data.forEach((k, node) -> {
-            if (!isExpired(node, now)) {
-                map.put(k, node.getValue());
-            }
-        });
+        long now = System.currentTimeMillis();
+
+        // 遍历所有分片组装视图
+        for (LocalCacheSegment<K, V> segment : segments) {
+            segment.getMap().forEach((k, node) -> {
+                if (!isExpired(node, now)) {
+                    map.put(k, node.getValue());
+                }
+            });
+        }
         return map;
     }
 
@@ -196,7 +241,7 @@ public class BoundedLocalCache<K, V> implements Cache<K, V> {
         }
     }
 
-    // Node 类：链表操作添加 synchronized 保护
+    // Node类保持不变（作为静态内部类）
     static class Node<K, V> {
         private final K key;
         private final V value;
@@ -224,7 +269,6 @@ public class BoundedLocalCache<K, V> implements Cache<K, V> {
         public long getExpireAt() { return expireAt; }
         public void setExpireAt(long time) { this.expireAt = time; }
 
-        // 时间轮链表操作（需要外部 synchronized 保护）
         public Node<K, V> getPrevInTimerWheel() { return prevInTimerWheel; }
         public void setPrevInTimerWheel(Node<K, V> prev) { this.prevInTimerWheel = prev; }
         public Node<K, V> getNextInTimerWheel() { return nextInTimerWheel; }
