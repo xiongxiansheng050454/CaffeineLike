@@ -17,6 +17,38 @@ public final class Caffeine<K, V> {
     boolean weakValues;
     boolean recordStats;
 
+    // 内存敏感模式（仅对Soft引用有效）
+    private boolean memorySensitive = false;
+    private double memoryWarningThreshold = 0.75;
+    private double memoryEmergencyThreshold = 0.85;
+
+    /**
+     * 启用内存敏感模式：当JVM堆内存不足时自动清理Soft引用
+     * 仅当使用softValues()时有效
+     */
+    public Caffeine<K, V> memorySensitive() {
+        this.memorySensitive = true;
+        return this;
+    }
+
+    /**
+     * 设置内存阈值（高级配置）
+     * @param warning 警告阈值（默认0.75）
+     * @param emergency 紧急清理阈值（默认0.85）
+     */
+    public Caffeine<K, V> memoryThresholds(double warning, double emergency) {
+        if (warning <= 0 || emergency <= 0 || warning >= emergency) {
+            throw new IllegalArgumentException("Invalid thresholds");
+        }
+        this.memoryWarningThreshold = warning;
+        this.memoryEmergencyThreshold = emergency;
+        return this;
+    }
+
+    boolean isMemorySensitive() { return memorySensitive; }
+    double getWarningThreshold() { return memoryWarningThreshold; }
+    double getEmergencyThreshold() { return memoryEmergencyThreshold; }
+
     private Caffeine() {}
 
     public static <K, V> Caffeine<K, V> newBuilder() {

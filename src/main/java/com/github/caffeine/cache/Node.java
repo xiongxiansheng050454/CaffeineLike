@@ -53,6 +53,10 @@ public class Node<K, V> {
         }
     }
 
+    public ReferenceStrength getValueStrength() {
+        return valueStrength;
+    }
+
     public K getKey() {
         return key;
     }
