@@ -1,15 +1,17 @@
 package com.github.caffeine.cache;
 
+import com.github.caffeine.cache.reference.ReferenceStrength;
 import java.util.concurrent.TimeUnit;
 
 public final class Caffeine<K, V> {
-    // 配置项（参考源码中的字段命名）
     static final int UNSET_INT = -1;
     long maximumSize = UNSET_INT;
     long maximumWeight = UNSET_INT;
     long expireAfterWriteNanos = UNSET_INT;
     long expireAfterAccessNanos = UNSET_INT;
     int initialCapacity = UNSET_INT;
+
+    // 引用类型配置（已存在，但需要添加 getter）
     boolean weakKeys;
     boolean softValues;
     boolean weakValues;
@@ -21,7 +23,6 @@ public final class Caffeine<K, V> {
         return new Caffeine<>();
     }
 
-    // 链式配置方法 - 容量控制
     public Caffeine<K, V> initialCapacity(int initialCapacity) {
         if (initialCapacity < 0) throw new IllegalArgumentException();
         this.initialCapacity = initialCapacity;
@@ -34,7 +35,6 @@ public final class Caffeine<K, V> {
         return this;
     }
 
-    // 链式配置方法 - 过期时间
     public Caffeine<K, V> expireAfterWrite(long duration, TimeUnit unit) {
         this.expireAfterWriteNanos = unit.toNanos(duration);
         return this;
@@ -45,7 +45,6 @@ public final class Caffeine<K, V> {
         return this;
     }
 
-    // 链式配置方法 - 引用类型（参考源码中的 Strength 概念）
     public Caffeine<K, V> weakKeys() {
         this.weakKeys = true;
         return this;
@@ -53,13 +52,13 @@ public final class Caffeine<K, V> {
 
     public Caffeine<K, V> weakValues() {
         this.weakValues = true;
-        this.softValues = false;
+        this.softValues = false;  // 互斥
         return this;
     }
 
     public Caffeine<K, V> softValues() {
         this.softValues = true;
-        this.weakValues = false;
+        this.weakValues = false;  // 互斥
         return this;
     }
 
@@ -68,13 +67,17 @@ public final class Caffeine<K, V> {
         return this;
     }
 
-    // 构建方法 - 创建缓存实例
-    @SuppressWarnings("unchecked")
     public <K1 extends K, V1 extends V> Cache<K1, V1> build() {
-        return (Cache<K1, V1>) new BoundedLocalCache<>(this);
+        return (Cache<K1, V1>)new BoundedLocalCache<>(this);
     }
 
-    // 内部辅助方法
+    // 新增：获取 Value 的引用强度
+    public ReferenceStrength valueStrength() {
+        if (weakValues) return ReferenceStrength.WEAK;
+        if (softValues) return ReferenceStrength.SOFT;
+        return ReferenceStrength.STRONG;
+    }
+
     boolean evicts() {
         return maximumSize != UNSET_INT || maximumWeight != UNSET_INT;
     }

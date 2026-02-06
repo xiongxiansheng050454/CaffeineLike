@@ -1,59 +1,116 @@
 package com.github.caffeine.cache;
 
 import com.github.caffeine.CacheUtils;
+import com.github.caffeine.cache.reference.ManualReference;
+import com.github.caffeine.cache.reference.ManualReferenceQueue;
+import com.github.caffeine.cache.reference.ReferenceStrength;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.LongAdder;
 
 public class BoundedLocalCache<K, V> implements Cache<K, V> {
-    // 分片架构替代单ConcurrentHashMap
     private final LocalCacheSegment<K, V>[] segments;
     private final int segmentMask;
-
     private final Caffeine<K, V> builder;
     private final HierarchicalTimerWheel<K, V> timerWheel;
+
+    // 新增：引用队列（仅当使用弱/软引用时初始化）
+    private final ManualReferenceQueue<V> referenceQueue;
+    private final Thread referenceCleanupThread;
+    private final boolean usesReferences;
 
     private final LongAdder hitCount = new LongAdder();
     private final LongAdder missCount = new LongAdder();
     private final LongAdder expireCount = new LongAdder();
+    private final LongAdder collectedCount = new LongAdder();  // 新增：统计被 GC 回收的数量
 
     @SuppressWarnings("unchecked")
     public BoundedLocalCache(Caffeine<K, V> builder) {
         this.builder = builder;
+        this.usesReferences = builder.valueStrength() != ReferenceStrength.STRONG;
 
-        // 计算分片数：基于并发级别（默认CPU核心数）
+        // 初始化引用队列（如果启用弱/软引用）
+        if (usesReferences) {
+            this.referenceQueue = new ManualReferenceQueue<>();
+            this.referenceCleanupThread = new Thread(this::processReferenceQueue, "reference-cleanup");
+            this.referenceCleanupThread.setDaemon(true);
+            this.referenceCleanupThread.start();
+        } else {
+            this.referenceQueue = null;
+            this.referenceCleanupThread = null;
+        }
+
+        // 分片初始化（保持原有逻辑）
         int concurrencyLevel = Runtime.getRuntime().availableProcessors();
         int segmentCount = CacheUtils.tableSizeFor(concurrencyLevel);
         this.segmentMask = segmentCount - 1;
 
-        // 计算单分片容量
         int totalCapacity = builder.initialCapacity > 0 ? builder.initialCapacity : 16;
         int segmentCapacity = Math.max(1, totalCapacity / segmentCount);
 
-        // 初始化分片数组
         this.segments = new LocalCacheSegment[segmentCount];
         for (int i = 0; i < segmentCount; i++) {
             segments[i] = new LocalCacheSegment<>(segmentCapacity);
         }
 
-        // 初始化时间轮（全局唯一，与分片无关）
+        // 时间轮初始化
         if (builder.expiresAfterWrite() || builder.expiresAfterAccess()) {
             this.timerWheel = new HierarchicalTimerWheel<>(this::onTimerExpired);
         } else {
             this.timerWheel = null;
         }
-
-        System.out.println("Initialized sharded cache: " + segmentCount +
-                " segments, mask=0x" + Integer.toHexString(segmentMask));
     }
 
     /**
-     * 哈希定位：找到key对应的分片（核心优化点，O(1)定位）
+     * 引用队列处理线程：模拟 JVM 的 ReferenceHandler 线程
+     * 对应 Caffeine 中检查 ReferenceQueue 并移除失效节点的逻辑
      */
+    private void processReferenceQueue() {
+        while (!Thread.currentThread().isInterrupted()) {
+            try {
+                ManualReference<V> ref = referenceQueue.poll();
+                if (ref != null) {
+                    // 引用被 GC 清理，需要从缓存中移除对应节点
+                    // 由于 ManualReference 不直接持有 key，我们需要遍历查找（生产环境应优化）
+                    cleanupCollectedReference(ref);
+                } else {
+                    // 无引用时休眠，避免 CPU 空转
+                    Thread.sleep(100);
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+        }
+    }
+
+    /**
+     * 清理被回收的引用对应的节点
+     * 注意：实际 Caffeine 通过 Node 反向指针优化，这里简化处理
+     */
+    private void cleanupCollectedReference(ManualReference<V> ref) {
+        // 遍历所有 segment 查找持有该引用的节点
+        // 优化：在真实场景中，Node 应持有 key 以便直接定位
+        for (LocalCacheSegment<K, V> segment : segments) {
+            segment.getMap().values().removeIf(node -> {
+                if (node.getValueReference() == ref) {
+                    // 从时间轮中取消（如果存在）
+                    if (timerWheel != null) {
+                        synchronized (node) {
+                            timerWheel.cancel(node);
+                        }
+                    }
+                    collectedCount.increment();
+                    return true;
+                }
+                return false;
+            });
+        }
+    }
+
     private LocalCacheSegment<K, V> segmentFor(K key) {
         int hash = CacheUtils.spread(key.hashCode());
-        // 位运算替代取模：hash % segmentCount == hash & (segmentCount - 1)
         return segments[hash & segmentMask];
     }
 
@@ -67,10 +124,17 @@ public class BoundedLocalCache<K, V> implements Cache<K, V> {
             return null;
         }
 
+        // 检查引用是否被清理（弱/软引用场景）
+        if (node.isValueCollected()) {
+            segment.removeNode(key);
+            collectedCount.increment();
+            missCount.increment();
+            return null;
+        }
+
         long now = System.currentTimeMillis();
 
         if (isExpired(node, now)) {
-            // 使用removeNode确保原子性（compare-and-remove）
             if (segment.removeNode(key, node)) {
                 expireCount.increment();
                 if (timerWheel != null) {
@@ -83,7 +147,7 @@ public class BoundedLocalCache<K, V> implements Cache<K, V> {
             return null;
         }
 
-        // expireAfterAccess 处理（毫秒计算）
+        // 处理 expireAfterAccess
         if (builder.expiresAfterAccess()) {
             long newExpireAt = now + TimeUnit.NANOSECONDS.toMillis(builder.expireAfterAccessNanos);
             node.setAccessTime(now);
@@ -101,21 +165,30 @@ public class BoundedLocalCache<K, V> implements Cache<K, V> {
         long now = System.currentTimeMillis();
         long expireAt = calculateExpireAt(now);
 
-        Node<K, V> newNode = new Node<>(key, value, now, expireAt);
+        // 根据配置选择引用强度（关键整合点）
+        ReferenceStrength strength = builder.valueStrength();
 
-        // 注意：最大容量检查现在是基于全局size的近似值，或需要遍历所有segment
-        // 简化策略：这里使用全局size检查，实际Caffeine会在每个segment独立触发驱逐
+        // 创建新节点（传入 referenceQueue 如果是弱/软引用）
+        Node<K, V> newNode = new Node<>(key, value, now, expireAt, strength, referenceQueue);
+
+        // 容量检查（简化版）
         if (builder.evicts() && builder.maximumSize > 0 && estimatedSize() >= builder.maximumSize) {
-            // TODO: 实现W-TinyLFU淘汰，此处暂时跳过插入或简单淘汰
+            // TODO: 实现 W-TinyLFU 淘汰
             return;
         }
 
         Node<K, V> oldNode = segment.putNode(key, newNode);
 
+        // 处理旧节点的时间轮取消
         if (timerWheel != null) {
             if (oldNode != null) {
                 synchronized (oldNode) {
                     timerWheel.cancel(oldNode);
+                    // 如果是弱/软引用，触发旧引用的清理（加速 GC）
+                    ManualReference<V> oldRef = oldNode.getValueReference();
+                    if (oldRef != null) {
+                        oldRef.clear();
+                    }
                 }
             }
             if (expireAt > 0) {
@@ -131,17 +204,20 @@ public class BoundedLocalCache<K, V> implements Cache<K, V> {
     public void invalidate(K key) {
         LocalCacheSegment<K, V> segment = segmentFor(key);
         Node<K, V> node = segment.removeNode(key);
-        if (node != null && timerWheel != null) {
-            synchronized (node) {
-                timerWheel.cancel(node);
+        if (node != null) {
+            if (timerWheel != null) {
+                synchronized (node) {
+                    timerWheel.cancel(node);
+                }
+            }
+            // 如果是引用类型，主动清理引用
+            ManualReference<V> ref = node.getValueReference();
+            if (ref != null) {
+                ref.clear();
             }
         }
     }
 
-    /**
-     * 时间轮回调：Key过期触发
-     * 注意：过期时需要通过key重新定位segment，因为Node不持有segment引用
-     */
     private void onTimerExpired(K key) {
         LocalCacheSegment<K, V> segment = segmentFor(key);
         Node<K, V> node = segment.getNode(key);
@@ -149,9 +225,11 @@ public class BoundedLocalCache<K, V> implements Cache<K, V> {
 
         long now = System.currentTimeMillis();
         if (isExpired(node, now)) {
-            // 使用removeNode确保原子性（只有当node未被替换时才删除）
             if (segment.removeNode(key, node)) {
                 expireCount.increment();
+                // 清理引用
+                ManualReference<V> ref = node.getValueReference();
+                if (ref != null) ref.clear();
             }
         }
     }
@@ -192,7 +270,6 @@ public class BoundedLocalCache<K, V> implements Cache<K, V> {
 
     @Override
     public void invalidateAll() {
-        // 遍历所有分片执行clear
         for (LocalCacheSegment<K, V> segment : segments) {
             segment.getMap().values().forEach(node -> {
                 if (timerWheel != null) {
@@ -200,6 +277,8 @@ public class BoundedLocalCache<K, V> implements Cache<K, V> {
                         timerWheel.cancel(node);
                     }
                 }
+                ManualReference<V> ref = node.getValueReference();
+                if (ref != null) ref.clear();
             });
             segment.getMap().clear();
         }
@@ -219,11 +298,13 @@ public class BoundedLocalCache<K, V> implements Cache<K, V> {
         ConcurrentHashMap<K, V> map = new ConcurrentHashMap<>();
         long now = System.currentTimeMillis();
 
-        // 遍历所有分片组装视图
         for (LocalCacheSegment<K, V> segment : segments) {
             segment.getMap().forEach((k, node) -> {
-                if (!isExpired(node, now)) {
-                    map.put(k, node.getValue());
+                if (!isExpired(node, now) && !node.isValueCollected()) {
+                    V value = node.getValue();
+                    if (value != null) {  // 防御性检查（弱引用可能为 null）
+                        map.put(k, value);
+                    }
                 }
             });
         }
@@ -232,57 +313,15 @@ public class BoundedLocalCache<K, V> implements Cache<K, V> {
 
     @Override
     public CacheStats stats() {
-        return new CacheStats(hitCount.sum(), missCount.sum(), expireCount.sum());
+        return new CacheStats(hitCount.sum(), missCount.sum(), expireCount.sum(),collectedCount.sum());
     }
 
     public void shutdown() {
         if (timerWheel != null) {
             timerWheel.shutdown();
         }
-    }
-
-    // Node类保持不变（作为静态内部类）
-    static class Node<K, V> {
-        private final K key;
-        private final V value;
-        private final long writeTime;
-        private volatile long accessTime;
-        private volatile long expireAt;
-
-        // 时间轮链表指针
-        private Node<K, V> prevInTimerWheel;
-        private Node<K, V> nextInTimerWheel;
-
-        Node(K key, V value, long writeTime, long expireAt) {
-            this.key = key;
-            this.value = value;
-            this.writeTime = writeTime;
-            this.accessTime = writeTime;
-            this.expireAt = expireAt;
-        }
-
-        public K getKey() { return key; }
-        public V getValue() { return value; }
-        public long getWriteTime() { return writeTime; }
-        public long getAccessTime() { return accessTime; }
-        public void setAccessTime(long time) { this.accessTime = time; }
-        public long getExpireAt() { return expireAt; }
-        public void setExpireAt(long time) { this.expireAt = time; }
-
-        public Node<K, V> getPrevInTimerWheel() { return prevInTimerWheel; }
-        public void setPrevInTimerWheel(Node<K, V> prev) { this.prevInTimerWheel = prev; }
-        public Node<K, V> getNextInTimerWheel() { return nextInTimerWheel; }
-        public void setNextInTimerWheel(Node<K, V> next) { this.nextInTimerWheel = next; }
-
-        public void detachFromTimerWheel() {
-            Node<K, V> prev = this.prevInTimerWheel;
-            Node<K, V> next = this.nextInTimerWheel;
-
-            if (prev != null) prev.setNextInTimerWheel(next);
-            if (next != null) next.setPrevInTimerWheel(prev);
-
-            this.prevInTimerWheel = null;
-            this.nextInTimerWheel = null;
+        if (referenceCleanupThread != null) {
+            referenceCleanupThread.interrupt();
         }
     }
 }

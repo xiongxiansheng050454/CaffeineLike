@@ -42,7 +42,7 @@ public class HierarchicalTimerWheel<K, V> {
         this.schedulerThread.start();
     }
 
-    public void schedule(BoundedLocalCache.Node<K, V> node, long delayMs) {
+    public void schedule(Node<K, V> node, long delayMs) {
         long expirationTime = currentTime + delayMs;
 
         synchronized (lock) {
@@ -57,7 +57,7 @@ public class HierarchicalTimerWheel<K, V> {
         }
     }
 
-    public void cancel(BoundedLocalCache.Node<K, V> node) {
+    public void cancel(Node<K, V> node) {
         synchronized (lock) {
             node.detachFromTimerWheel();
         }
@@ -82,9 +82,9 @@ public class HierarchicalTimerWheel<K, V> {
         currentTime += 1000;
         int secondSlot = calculateSlot(currentTime, 0);
 
-        List<BoundedLocalCache.Node<K, V>> expired = wheels.get(0)[secondSlot].clearAndGet();
+        List<Node<K, V>> expired = wheels.get(0)[secondSlot].clearAndGet();
 
-        for (BoundedLocalCache.Node<K, V> node : expired) {
+        for (Node<K, V> node : expired) {
             if (node.getExpireAt() <= currentTime) {
                 callback.onExpired(node.getKey());
             } else {
@@ -101,9 +101,9 @@ public class HierarchicalTimerWheel<K, V> {
         if (level >= wheels.size()) return;
 
         int slot = calculateSlot(currentTime, level);
-        List<BoundedLocalCache.Node<K, V>> nodes = wheels.get(level)[slot].clearAndGet();
+        List<Node<K, V>> nodes = wheels.get(level)[slot].clearAndGet();
 
-        for (BoundedLocalCache.Node<K, V> node : nodes) {
+        for (Node<K, V> node : nodes) {
             long remaining = node.getExpireAt() - currentTime;
 
             if (remaining < TICK_MS[level - 1]) {
@@ -120,7 +120,7 @@ public class HierarchicalTimerWheel<K, V> {
         }
     }
 
-    private void reschedule(BoundedLocalCache.Node<K, V> node) {
+    private void reschedule(Node<K, V> node) {
         long delay = node.getExpireAt() - currentTime;
         if (delay > 0) {
             schedule(node, delay);
@@ -137,25 +137,25 @@ public class HierarchicalTimerWheel<K, V> {
     }
 
     private static class TimerBucket<K, V> {
-        private final BoundedLocalCache.Node<K, V> sentinel;
+        private final Node<K, V> sentinel;
 
         TimerBucket() {
-            sentinel = new BoundedLocalCache.Node<>(null, null, 0, -1);
+            sentinel = new Node<>(null, null, 0, 0,null,null);
             sentinel.setNextInTimerWheel(sentinel);
             sentinel.setPrevInTimerWheel(sentinel);
         }
 
-        void add(BoundedLocalCache.Node<K, V> node) {
-            BoundedLocalCache.Node<K, V> next = sentinel.getNextInTimerWheel();
+        void add(Node<K, V> node) {
+            Node<K, V> next = sentinel.getNextInTimerWheel();
             node.setPrevInTimerWheel(sentinel);
             node.setNextInTimerWheel(next);
             sentinel.setNextInTimerWheel(node);
             next.setPrevInTimerWheel(node);
         }
 
-        List<BoundedLocalCache.Node<K, V>> clearAndGet() {
-            List<BoundedLocalCache.Node<K, V>> list = new ArrayList<>();
-            BoundedLocalCache.Node<K, V> current = sentinel.getNextInTimerWheel();
+        List<Node<K, V>> clearAndGet() {
+            List<Node<K, V>> list = new ArrayList<>();
+            Node<K, V> current = sentinel.getNextInTimerWheel();
 
             while (current != sentinel) {
                 list.add(current);
