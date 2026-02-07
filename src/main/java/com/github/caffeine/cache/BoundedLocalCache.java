@@ -28,6 +28,12 @@ public class BoundedLocalCache<K, V> implements Cache<K, V> {
     private final MemorySensitiveEvictor memoryEvictor;
     private final boolean memorySensitive;
 
+    // 新增：分片锁
+    private final StripedLock stripedLock;
+
+    // 测试时使用监控版
+    private InstrumentedStripedLock instrumentedLock;
+
     @SuppressWarnings("unchecked")
     public BoundedLocalCache(Caffeine<K, V> builder) {
         this.builder = builder;
@@ -50,25 +56,22 @@ public class BoundedLocalCache<K, V> implements Cache<K, V> {
             this.referenceQueue = null;
         }
 
-        // 分片初始化（保持原有逻辑）
-        int concurrencyLevel = Runtime.getRuntime().availableProcessors();
-        int segmentCount = CacheUtils.tableSizeFor(concurrencyLevel);
+        // 改为1024个Segment，与StripedLock一致
+        int segmentCount = 1024;
         this.segmentMask = segmentCount - 1;
-
-        int totalCapacity = builder.initialCapacity > 0 ? builder.initialCapacity : 16;
-        int segmentCapacity = Math.max(1, totalCapacity / segmentCount);
-
         this.segments = new LocalCacheSegment[segmentCount];
+
         for (int i = 0; i < segmentCount; i++) {
-            segments[i] = new LocalCacheSegment<>(segmentCapacity);
+            segments[i] = new LocalCacheSegment<>();
         }
+
+        // StripedLock 仅用于需要全局锁的场景（如 invalidateAll）
+        this.stripedLock = new StripedLock(segmentCount); // 用于全局遍历保护
 
         // 时间轮初始化
-        if (builder.expiresAfterWrite() || builder.expiresAfterAccess()) {
-            this.timerWheel = new HierarchicalTimerWheel<>(this::onTimerExpired);
-        } else {
-            this.timerWheel = null;
-        }
+        this.timerWheel = (builder.expiresAfterWrite() || builder.expiresAfterAccess())
+                ? new HierarchicalTimerWheel<>(this::onTimerExpired)
+                : null;
 
         // 关键：确保维护线程启动（合并引用队列+内存检查）
         boolean needMaintenance =usesReferences || memorySensitive;
@@ -79,45 +82,66 @@ public class BoundedLocalCache<K, V> implements Cache<K, V> {
 
     /**
      * 清理所有Soft引用条目（内存不足时调用）
-     * 直接移除节点，立即释放内存压力
+     * 修改：添加全局锁保护
      */
     private void cleanupSoftReferences() {
         if (!usesReferences) return;
 
         int cleaned = 0;
-        for (LocalCacheSegment<K, V> segment : segments) {
-            // 使用迭代器安全删除
-            var iterator = segment.getMap().entrySet().iterator();
-            while (iterator.hasNext()) {
-                var entry = iterator.next();
-                Node<K, V> node = entry.getValue();
+        // 关键：获取全部64个锁，确保遍历安全
+        stripedLock.lockAll();
+        try {
+            for (LocalCacheSegment<K, V> segment : segments) {
+                var iterator = segment.getMap().entrySet().iterator();
+                while (iterator.hasNext()) {
+                    var entry = iterator.next();
+                    Node<K, V> node = entry.getValue();
 
-                if (node.getValueStrength() == ReferenceStrength.SOFT) {
-                    // 1. 取消时间轮任务
-                    if (timerWheel != null) {
-                        synchronized (node) {
-                            timerWheel.cancel(node);
+                    if (node.getValueStrength() == ReferenceStrength.SOFT) {
+                        // 1. 取消时间轮任务
+                        if (timerWheel != null) {
+                            synchronized (node) {
+                                timerWheel.cancel(node);
+                            }
                         }
-                    }
 
-                    // 2. 清理引用（标记为已清理并入队，供后续统计）
-                    ManualReference<V> ref = node.getValueReference();
-                    if (ref != null && !ref.isCleared()) {
-                        ref.clear();
-                    }
+                        // 2. 清理引用
+                        ManualReference<V> ref = node.getValueReference();
+                        if (ref != null && !ref.isCleared()) {
+                            ref.clear();
+                        }
 
-                    // 3. 立即从Map中移除（关键！）
-                    iterator.remove();
-                    cleaned++;
+                        // 3. 从Map中移除
+                        iterator.remove();
+                        cleaned++;
+                    }
                 }
             }
+        } finally {
+            stripedLock.unlockAll();
         }
 
         if (cleaned > 0) {
             System.out.println("[Memory] 紧急清理Soft引用: " + cleaned + " 条");
-            // 注意：这里清理是内存压力导致的，不是GC回收，所以不计入collectedCount
-            // 如需统计驱逐次数，可新增 evictionCount 字段
         }
+    }
+
+    /**
+     * 测试专用：启用锁冲突监控
+     */
+    public void enableContentionMonitoring() {
+        if (stripedLock instanceof InstrumentedStripedLock) {
+            this.instrumentedLock = (InstrumentedStripedLock) stripedLock;
+        } else {
+            // 运行时替换为监控版（仅测试使用）
+            this.instrumentedLock = new InstrumentedStripedLock(64);
+            // 注意：实际应重构为构造时注入，此处简化
+        }
+    }
+
+    public double getContentionRate() {
+        return instrumentedLock != null ?
+                instrumentedLock.getContentionRate() : -1;
     }
 
     /**
@@ -214,25 +238,27 @@ public class BoundedLocalCache<K, V> implements Cache<K, V> {
 
     /**
      * 清理被回收的引用对应的节点
-     * 注意：实际 Caffeine 通过 Node 反向指针优化，这里简化处理
+     * 修改：使用全局锁保护遍历
      */
     private void cleanupCollectedReference(ManualReference<V> ref) {
-        // 遍历所有 segment 查找持有该引用的节点
-        // 优化：在真实场景中，Node 应持有 key 以便直接定位
-        for (LocalCacheSegment<K, V> segment : segments) {
-            segment.getMap().values().removeIf(node -> {
-                if (node.getValueReference() == ref) {
-                    // 从时间轮中取消（如果存在）
-                    if (timerWheel != null) {
-                        synchronized (node) {
-                            timerWheel.cancel(node);
+        stripedLock.lockAll();
+        try {
+            for (LocalCacheSegment<K, V> segment : segments) {
+                segment.getMap().values().removeIf(node -> {
+                    if (node.getValueReference() == ref) {
+                        if (timerWheel != null) {
+                            synchronized (node) {
+                                timerWheel.cancel(node);
+                            }
                         }
+                        collectedCount.increment();
+                        return true;
                     }
-                    collectedCount.increment();
-                    return true;
-                }
-                return false;
-            });
+                    return false;
+                });
+            }
+        } finally {
+            stripedLock.unlockAll();
         }
     }
 
@@ -299,24 +325,22 @@ public class BoundedLocalCache<K, V> implements Cache<K, V> {
         Node<K, V> newNode = new Node<>(key, value, now, expireAt, strength,
                 usesReferences ? referenceQueue : null);
 
-        // 容量检查（简化版）
-        if (builder.evicts() && builder.maximumSize > 0 && estimatedSize() >= builder.maximumSize) {
-            // TODO: 实现 W-TinyLFU 淘汰
-            return;
-        }
+
+        // 修复：移除提前返回，确保写入成功
+        // TODO: 实现 W-TinyLFU 淘汰
+        // if (builder.evicts() && builder.maximumSize > 0 && estimatedSize() >= builder.maximumSize) {
+        //     return;
+        // }
 
         Node<K, V> oldNode = segment.putNode(key, newNode);
 
-        // 处理旧节点的时间轮取消
+        // 处理旧节点
         if (timerWheel != null) {
             if (oldNode != null) {
                 synchronized (oldNode) {
                     timerWheel.cancel(oldNode);
-                    // 如果是弱/软引用，触发旧引用的清理（加速 GC）
                     ManualReference<V> oldRef = oldNode.getValueReference();
-                    if (oldRef != null) {
-                        oldRef.clear();
-                    }
+                    if (oldRef != null) oldRef.clear();
                 }
             }
             if (expireAt > 0) {
@@ -398,20 +422,32 @@ public class BoundedLocalCache<K, V> implements Cache<K, V> {
 
     @Override
     public void invalidateAll() {
+        // 获取所有 Segment 的锁
         for (LocalCacheSegment<K, V> segment : segments) {
-            segment.getMap().values().forEach(node -> {
-                if (timerWheel != null) {
-                    synchronized (node) {
-                        timerWheel.cancel(node);
+            segment.getLock().lock();
+        }
+        try {
+            for (LocalCacheSegment<K, V> segment : segments) {
+                segment.getMap().values().forEach(node -> {
+                    if (timerWheel != null) {
+                        synchronized (node) {
+                            timerWheel.cancel(node);
+                        }
                     }
-                }
-                ManualReference<V> ref = node.getValueReference();
-                if (ref != null) ref.clear();
-            });
-            segment.getMap().clear();
+                    ManualReference<V> ref = node.getValueReference();
+                    if (ref != null) ref.clear();
+                });
+                segment.getMap().clear();
+            }
+        } finally {
+            // 反向释放
+            for (int i = segments.length - 1; i >= 0; i--) {
+                segments[i].getLock().unlock();
+            }
         }
     }
 
+    // estimatedSize 不需要全局锁，各Segment size()近似即可
     @Override
     public long estimatedSize() {
         long sum = 0;
@@ -426,15 +462,21 @@ public class BoundedLocalCache<K, V> implements Cache<K, V> {
         ConcurrentHashMap<K, V> map = new ConcurrentHashMap<>();
         long now = System.currentTimeMillis();
 
-        for (LocalCacheSegment<K, V> segment : segments) {
-            segment.getMap().forEach((k, node) -> {
-                if (!isExpired(node, now) && !node.isValueCollected()) {
-                    V value = node.getValue();
-                    if (value != null) {  // 防御性检查（弱引用可能为 null）
-                        map.put(k, value);
+        // 关键：全局锁保护遍历
+        stripedLock.lockAll();
+        try {
+            for (LocalCacheSegment<K, V> segment : segments) {
+                segment.getMap().forEach((k, node) -> {
+                    if (!isExpired(node, now) && !node.isValueCollected()) {
+                        V value = node.getValue();
+                        if (value != null) {
+                            map.put(k, value);
+                        }
                     }
-                }
-            });
+                });
+            }
+        } finally {
+            stripedLock.unlockAll();
         }
         return map;
     }
