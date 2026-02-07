@@ -4,25 +4,48 @@ import com.github.caffeine.cache.reference.ManualReference;
 import com.github.caffeine.cache.reference.ManualReferenceQueue;
 import com.github.caffeine.cache.reference.ReferenceStrength;
 
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.VarHandle;
+
+import jdk.internal.vm.annotation.Contended;
+
 /**
- * 增强的 Node，支持强/弱/软引用存储 Value
- * 参考 Caffeine 的 Node 设计（AddValue.java 中的逻辑）
+ * 增强的 Node，支持 VarHandle 无锁读写
+ * 参考 Caffeine 的 Node 设计（AddValue.java + IntermittentNull.java）
  */
 public class Node<K, V> {
+    private static final VarHandle VALUE_HANDLE;
+
     private final K key;
 
-    // 根据强度决定存储方式：强引用直接存，弱/软引用包装
-    private final Object valueHolder;
-    private final ReferenceStrength valueStrength;
-    private final ManualReferenceQueue<V> refQueue; // 仅弱/软引用时使用
+    // @Contended 确保 value 独占 64 字节缓存行，避免伪共享
+    @Contended
+    private volatile Object valueHolder;
 
-    private final long writeTime;
+    private final ReferenceStrength valueStrength;
+    private final ManualReferenceQueue<V> refQueue;
+
+    // 时间戳字段也隔离，避免与 value 竞争缓存行
+    @Contended
     private volatile long accessTime;
+
+    @Contended
     private volatile long expireAt;
 
-    // 时间轮链表指针（保持与原有设计兼容）
+    private final long writeTime;
+
+    // 时间轮链表指针
     private Node<K, V> prevInTimerWheel;
     private Node<K, V> nextInTimerWheel;
+
+    static {
+        try {
+            VALUE_HANDLE = MethodHandles.lookup()
+                    .findVarHandle(Node.class, "valueHolder", Object.class);
+        } catch (Exception e) {
+            throw new ExceptionInInitializerError(e);
+        }
+    }
 
     /**
      * 构造方法：根据强度自动选择存储方式
@@ -37,19 +60,13 @@ public class Node<K, V> {
         this.expireAt = expireAt;
 
         if (strength == ReferenceStrength.STRONG || refQueue == null) {
-            // 强引用：直接存储（对应 Caffeine 的 strongValues）
-            this.valueHolder = value;
+            // 强引用：使用 setRelease（lazySet）初始化，避免立即刷回内存
+            VALUE_HANDLE.setRelease(this, value);
         } else {
-            // 弱/软引用：包装为 ManualReference（对应 Caffeine 的 weakValues/softValues）
+            // 弱/软引用：包装为 ManualReference
             ManualReference<V> ref = new ManualReference<>(value, refQueue, strength);
-            this.valueHolder = ref;
-
-            // 设置清理回调：当引用被 GC 时，标记节点为失效
-            // 注意：这里只是标记，实际从 Map 移除由 ReferenceQueue 轮询线程处理
-            ref.setCleanupCallback(() -> {
-                // 标记过期时间为 0，让下次访问时触发清理
-                this.expireAt = 0;
-            });
+            VALUE_HANDLE.setRelease(this, ref);
+            ref.setCleanupCallback(() -> this.expireAt = 0);
         }
     }
 
@@ -62,21 +79,25 @@ public class Node<K, V> {
     }
 
     /**
-     * 获取 Value（核心方法，参考 Caffeine 的 getValue 实现）
-     * 处理弱/软引用的 null 检查（对象被 GC 的情况）
+     * 无锁读：volatile 语义（getAcquire）
+     * 对应 Caffeine 的 getValue 逻辑
      */
     @SuppressWarnings("unchecked")
     public V getValue() {
         if (valueStrength == ReferenceStrength.STRONG) {
-            return (V) valueHolder;
+            // 强引用：直接 volatile 读
+            return (V) VALUE_HANDLE.getAcquire(this);
         } else {
-            ManualReference<V> ref = (ManualReference<V>) valueHolder;
+            // 弱/软引用：读取 ManualReference，再读 referent
+            ManualReference<V> ref = (ManualReference<V>) VALUE_HANDLE.getAcquire(this);
             if (ref == null) return null;
 
             V value = ref.get();
+
+            // 防御 stale read：如果读到 null 但引用未被清理，重试一次
+            // 参考 Caffeine 的 IntermittentNull.java 模式
             if (value == null && !ref.isCleared()) {
-                // 防御性编程：如果读到 null 但引用未被标记为 cleared，
-                // 可能是并发导致的可见性问题，重试一次（参考 AddValue.java）
+                VarHandle.loadLoadFence();  // 加载屏障
                 value = ref.get();
             }
             return value;
@@ -84,76 +105,95 @@ public class Node<K, V> {
     }
 
     /**
-     * 获取原始引用对象（用于清理时比较）
+     * 无锁写：lazySet 语义（setRelease）
+     * 性能优于 volatile 写，适合缓存更新场景
      */
+    public void setValue(V value) {
+        if (valueStrength == ReferenceStrength.STRONG) {
+            VALUE_HANDLE.setRelease(this, value);
+        } else {
+            // 软/弱引用：创建新引用，使用 storeStoreFence 确保顺序
+            ManualReference<V> newRef = new ManualReference<>(value, refQueue, valueStrength);
+            ManualReference<V> oldRef = (ManualReference<V>) VALUE_HANDLE.getAcquire(this);
+
+            VALUE_HANDLE.setRelease(this, newRef);
+            VarHandle.storeStoreFence();  // 确保新引用可见后再清理旧引用
+
+            if (oldRef != null) oldRef.clear();
+        }
+    }
+
+    /**
+     * CAS 更新（用于复杂并发控制，如 refresh）
+     */
+    public boolean casValue(V expected, V update) {
+        if (valueStrength != ReferenceStrength.STRONG) {
+            throw new UnsupportedOperationException("CAS only supported for strong values");
+        }
+        return VALUE_HANDLE.compareAndSet(this, expected, update);
+    }
+
     @SuppressWarnings("unchecked")
     public ManualReference<V> getValueReference() {
-        if (valueStrength == ReferenceStrength.STRONG) {
-            return null;
-        }
-        return (ManualReference<V>) valueHolder;
+        if (valueStrength == ReferenceStrength.STRONG) return null;
+        return (ManualReference<V>) VALUE_HANDLE.getAcquire(this);
     }
 
     public boolean isStrongValue() {
         return valueStrength == ReferenceStrength.STRONG;
     }
 
+    // === 时间戳访问也使用 VarHandle 优化 ===
+    public long getAccessTime() {
+        return (long) ACCESS_TIME_HANDLE.getAcquire(this);
+    }
+
+    public void setAccessTime(long time) {
+        ACCESS_TIME_HANDLE.setRelease(this, time);
+    }
+
+    public long getExpireAt() {
+        return (long) EXPIRE_AT_HANDLE.getAcquire(this);
+    }
+
+    public void setExpireAt(long time) {
+        EXPIRE_AT_HANDLE.setRelease(this, time);
+    }
+
+    private static final VarHandle ACCESS_TIME_HANDLE;
+    private static final VarHandle EXPIRE_AT_HANDLE;
+
+    static {
+        try {
+            MethodHandles.Lookup lookup = MethodHandles.lookup();
+            ACCESS_TIME_HANDLE = lookup.findVarHandle(Node.class, "accessTime", long.class);
+            EXPIRE_AT_HANDLE = lookup.findVarHandle(Node.class, "expireAt", long.class);
+        } catch (Exception e) {
+            throw new ExceptionInInitializerError(e);
+        }
+    }
+
     public long getWriteTime() {
         return writeTime;
     }
 
-    public long getAccessTime() {
-        return accessTime;
-    }
-
-    public void setAccessTime(long time) {
-        this.accessTime = time;
-    }
-
-    public long getExpireAt() {
-        return expireAt;
-    }
-
-    public void setExpireAt(long time) {
-        this.expireAt = time;
-    }
-
-    /**
-     * 检查节点是否因引用被清理而失效
-     */
     public boolean isValueCollected() {
-        if (valueStrength == ReferenceStrength.STRONG) {
-            return false;
-        }
-        @SuppressWarnings("unchecked")
-        ManualReference<V> ref = (ManualReference<V>) valueHolder;
+        if (valueStrength == ReferenceStrength.STRONG) return false;
+        ManualReference<V> ref = getValueReference();
         return ref == null || ref.isCleared() || ref.get() == null;
     }
 
     // 时间轮链表操作（保持不变）
-    public Node<K, V> getPrevInTimerWheel() {
-        return prevInTimerWheel;
-    }
-
-    public void setPrevInTimerWheel(Node<K, V> prev) {
-        this.prevInTimerWheel = prev;
-    }
-
-    public Node<K, V> getNextInTimerWheel() {
-        return nextInTimerWheel;
-    }
-
-    public void setNextInTimerWheel(Node<K, V> next) {
-        this.nextInTimerWheel = next;
-    }
+    public Node<K, V> getPrevInTimerWheel() { return prevInTimerWheel; }
+    public void setPrevInTimerWheel(Node<K, V> prev) { this.prevInTimerWheel = prev; }
+    public Node<K, V> getNextInTimerWheel() { return nextInTimerWheel; }
+    public void setNextInTimerWheel(Node<K, V> next) { this.nextInTimerWheel = next; }
 
     public void detachFromTimerWheel() {
         Node<K, V> prev = this.prevInTimerWheel;
         Node<K, V> next = this.nextInTimerWheel;
-
         if (prev != null) prev.setNextInTimerWheel(next);
         if (next != null) next.setPrevInTimerWheel(prev);
-
         this.prevInTimerWheel = null;
         this.nextInTimerWheel = null;
     }

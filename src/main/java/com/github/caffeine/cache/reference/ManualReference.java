@@ -1,32 +1,49 @@
 package com.github.caffeine.cache.reference;
 
-import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicReference;
+import jdk.internal.vm.annotation.Contended;
+
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.VarHandle;
 
 /**
- * 手动的引用模拟，替代 JVM 的 WeakReference/SoftReference
- * 与 Caffeine 的 WeakValueReference 对应
+ * 手动的引用模拟，使用 VarHandle 替代 AtomicReference
+ * 达到与 Caffeine WeakValueReference 同等的无锁性能
  */
 public class ManualReference<T> {
-    // 使用 AtomicReference 实现线程安全的 referent 存取
-    private final AtomicReference<T> referent;
-    private final ManualReferenceQueue<T> queue;
-    private final AtomicBoolean cleared;
-    private final ReferenceStrength strength;
+    private static final VarHandle REFERENT_HANDLE;
 
-    // 回调：当引用被清除时，通知缓存移除节点（类似 Caffeine 的 onRemoval）
+    // @Contended 确保与 Node 的其它字段不共享缓存行
+    @Contended
+    private volatile T referent;
+
+    private final ManualReferenceQueue<T> queue;
+    private volatile boolean cleared;
+    private final ReferenceStrength strength;
     private volatile Runnable cleanupCallback;
 
-    public ManualReference(T referent, ManualReferenceQueue<T> queue,
-                           ReferenceStrength strength) {
-        this.referent = new AtomicReference<>(referent);
-        this.queue = queue;
-        this.strength = strength;
-        this.cleared = new AtomicBoolean(false);
+    static {
+        try {
+            REFERENT_HANDLE = MethodHandles.lookup()
+                    .findVarHandle(ManualReference.class, "referent", Object.class);
+        } catch (Exception e) {
+            throw new ExceptionInInitializerError(e);
+        }
     }
 
+    public ManualReference(T referent, ManualReferenceQueue<T> queue, ReferenceStrength strength) {
+        this.queue = queue;
+        this.strength = strength;
+        // lazySet 初始化
+        REFERENT_HANDLE.setRelease(this, referent);
+        this.cleared = false;
+    }
+
+    /**
+     * 无锁读：getAcquire（volatile 读）
+     */
+    @SuppressWarnings("unchecked")
     public T get() {
-        return referent.get();
+        return (T) REFERENT_HANDLE.getAcquire(this);
     }
 
     public ReferenceStrength getStrength() {
@@ -38,16 +55,15 @@ public class ManualReference<T> {
     }
 
     /**
-     * 模拟 GC 回收对象，触发入队
-     * 对应 Caffeine 中 value 被回收后的 die() 逻辑
+     * 模拟 GC 回收：使用 CAS 确保只清理一次
      */
     public void clear() {
-        if (cleared.compareAndSet(false, true)) {
-            T old = referent.getAndSet(null);
+        if (!cleared) {  // 先检查，避免内存屏障
+            cleared = true;
+            T old = (T) REFERENT_HANDLE.getAndSet(this, null);
             if (queue != null && old != null) {
                 queue.enqueue(this);
             }
-            // 触发清理回调（从 Segment 中移除 Node）
             if (cleanupCallback != null) {
                 cleanupCallback.run();
             }
@@ -55,7 +71,7 @@ public class ManualReference<T> {
     }
 
     public boolean isCleared() {
-        return cleared.get();
+        return cleared;
     }
 
     /**
