@@ -16,6 +16,9 @@ public class ManualReference<T> {
     @Contended
     private volatile T referent;
 
+    // 新增：存储 key，用于反向查找
+    private final Object key;
+
     private final ManualReferenceQueue<T> queue;
     private volatile boolean cleared;
     private final ReferenceStrength strength;
@@ -30,7 +33,8 @@ public class ManualReference<T> {
         }
     }
 
-    public ManualReference(T referent, ManualReferenceQueue<T> queue, ReferenceStrength strength) {
+    public ManualReference(Object key, T referent, ManualReferenceQueue<T> queue, ReferenceStrength strength) {
+        this.key = key;  // 存储 key
         this.queue = queue;
         this.strength = strength;
         // lazySet 初始化
@@ -44,6 +48,12 @@ public class ManualReference<T> {
     @SuppressWarnings("unchecked")
     public T get() {
         return (T) REFERENT_HANDLE.getAcquire(this);
+    }
+
+    // 新增：获取 key 的方法
+    @SuppressWarnings("unchecked")
+    public <K> K getKey() {
+        return (K) key;
     }
 
     public ReferenceStrength getStrength() {

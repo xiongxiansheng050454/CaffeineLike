@@ -1,7 +1,9 @@
 package com.github.caffeine.cache;
 
+import com.github.caffeine.cache.event.CacheEvent;
 import com.github.caffeine.cache.reference.ReferenceStrength;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
 
 public final class Caffeine<K, V> {
     static final int UNSET_INT = -1;
@@ -21,6 +23,10 @@ public final class Caffeine<K, V> {
     private boolean memorySensitive = false;
     private double memoryWarningThreshold = 0.75;
     private double memoryEmergencyThreshold = 0.85;
+
+    // 新增：监听器配置
+    private Consumer<CacheEvent<K, V>> removalListener;
+    private Consumer<CacheEvent<K, V>> statsListener;
 
     /**
      * 启用内存敏感模式：当JVM堆内存不足时自动清理Soft引用
@@ -99,6 +105,22 @@ public final class Caffeine<K, V> {
         return this;
     }
 
+    /**
+     * 配置移除监听器（驱逐、过期、删除时触发）
+     */
+    public Caffeine<K, V> removalListener(Consumer<CacheEvent<K, V>> listener) {
+        this.removalListener = listener;
+        return this;
+    }
+
+    /**
+     * 配置统计监听器（写入、读取时触发，可选）
+     */
+    public Caffeine<K, V> statsListener(Consumer<CacheEvent<K, V>> listener) {
+        this.statsListener = listener;
+        return this;
+    }
+
     public <K1 extends K, V1 extends V> Cache<K1, V1> build() {
         return (Cache<K1, V1>)new BoundedLocalCache<>(this);
     }
@@ -121,4 +143,8 @@ public final class Caffeine<K, V> {
     boolean expiresAfterAccess() {
         return expireAfterAccessNanos != UNSET_INT;
     }
+
+    // Package-private getters
+    Consumer<CacheEvent<K, V>> getRemovalListener() { return removalListener; }
+    Consumer<CacheEvent<K, V>> getStatsListener() { return statsListener; }
 }

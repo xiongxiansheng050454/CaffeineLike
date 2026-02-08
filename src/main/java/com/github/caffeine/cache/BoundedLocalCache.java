@@ -1,16 +1,23 @@
 package com.github.caffeine.cache;
 
 import com.github.caffeine.CacheUtils;
+import com.github.caffeine.cache.concurrent.CacheEventRingBuffer;
+import com.github.caffeine.cache.event.CacheEvent;
+import com.github.caffeine.cache.event.CacheEventType;
 import com.github.caffeine.cache.reference.ManualReference;
 import com.github.caffeine.cache.reference.ManualReferenceQueue;
 import com.github.caffeine.cache.reference.ReferenceStrength;
 import jdk.internal.vm.annotation.Contended;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.concurrent.locks.LockSupport;
+import java.util.function.Consumer;
 
 public class BoundedLocalCache<K, V> implements Cache<K, V> {
     private final LocalCacheSegment<K, V>[] segments;
@@ -49,6 +56,12 @@ public class BoundedLocalCache<K, V> implements Cache<K, V> {
     // 缓存时间戳，每 100ms 更新一次（类似 Caffeine 的 ticker）
     private volatile long cachedTime;
 
+    // 新增：事件系统（可选，仅在配置了监听器时初始化）
+    private final CacheEventRingBuffer<K, V> eventBuffer;
+    private final Consumer<CacheEvent<K, V>> removalListener;
+    private final Consumer<CacheEvent<K, V>> statsListener;
+    private final boolean enableEvents;
+
     @SuppressWarnings("unchecked")
     public BoundedLocalCache(Caffeine<K, V> builder) {
         this.builder = builder;
@@ -62,6 +75,33 @@ public class BoundedLocalCache<K, V> implements Cache<K, V> {
             this.memoryEvictor.register(this::cleanupSoftReferences);
         } else {
             this.memoryEvictor = null;
+        }
+
+        // 初始化事件系统
+        this.removalListener = builder.getRemovalListener();
+        this.statsListener = builder.getStatsListener();
+        this.enableEvents = (removalListener != null || statsListener != null);
+
+        if (enableEvents) {
+            // 创建消费者数组
+            int consumerCount = 0;
+            if (removalListener != null) consumerCount++;
+            if (statsListener != null) consumerCount++;
+
+            @SuppressWarnings("unchecked")
+            Consumer<CacheEvent<K, V>>[] consumers = new Consumer[consumerCount];
+            int idx = 0;
+            if (removalListener != null) consumers[idx++] = removalListener;
+            if (statsListener != null) consumers[idx] = statsListener;
+
+            // RingBuffer大小：65536（2^16），足够缓存短时间爆发的事件
+            this.eventBuffer = new CacheEventRingBuffer<>(
+                    65536,
+                    true,  // 队列满时丢弃非关键事件（如READ）
+                    consumers
+            );
+        } else {
+            this.eventBuffer = null;
         }
 
         // 初始化引用队列（如果启用弱/软引用）
@@ -102,6 +142,33 @@ public class BoundedLocalCache<K, V> implements Cache<K, V> {
             }, "cache-time-ticker");
             timeTicker.setDaemon(true);
             timeTicker.start();
+        }
+    }
+
+    /**
+     * 发布事件 - 非阻塞，失败不抛异常
+     */
+    private void publishEvent(CacheEventType type, K key, V value) {
+        if (!enableEvents || eventBuffer == null) return;
+
+        // 只有驱逐、过期、删除事件强制确保送达，其他事件可能丢弃
+        boolean critical = (type == CacheEventType.EVICT ||
+                type == CacheEventType.EXPIRE ||
+                type == CacheEventType.REMOVE);
+
+        CacheEvent<K, V> event = CacheEvent.<K, V>builder()
+                .type(type)
+                .key(key)
+                .value(value)
+                .build();
+
+        boolean success = eventBuffer.publish(event);
+
+        if (!success && critical) {
+            // 关键事件失败时同步执行（类似Caffeine的同步回退）
+            if (removalListener != null) {
+                removalListener.accept(event);
+            }
         }
     }
 
@@ -253,28 +320,39 @@ public class BoundedLocalCache<K, V> implements Cache<K, V> {
     }
 
     /**
-     * 清理被回收的引用对应的节点
-     * 修改：使用全局锁保护遍历
+     * 清理被回收的引用对应的节点 - 修复版
+     * 直接使用写锁，避免乐观读转换的复杂性
      */
     private void cleanupCollectedReference(ManualReference<V> ref) {
-        stripedLock.lockAll();
+        K key = ref.getKey();
+        if (key == null) return;
+
+        LocalCacheSegment<K, V> segment = segmentFor(key);
+
+        // 直接使用写锁，确保原子性检查+删除
+        long stamp = segment.getLock().writeLock();
         try {
-            for (LocalCacheSegment<K, V> segment : segments) {
-                segment.getMap().values().removeIf(node -> {
-                    if (node.getValueReference() == ref) {
-                        if (timerWheel != null) {
-                            synchronized (node) {
-                                timerWheel.cancel(node);
-                            }
-                        }
-                        collectedCount.increment();
-                        return true;
+            // 在锁内重新获取节点，确保一致性
+            Node<K, V> node = segment.getMap().get(key);
+
+            // 双重检查：确保节点存在且引用匹配（防止误删）
+            if (node != null && node.getValueReference() == ref) {
+                // 取消时间轮
+                if (timerWheel != null) {
+                    synchronized (node) {
+                        timerWheel.cancel(node);
                     }
-                    return false;
-                });
+                }
+
+                // 移除节点
+                segment.getMap().remove(key);
+                collectedCount.increment();
+
+                // 发布事件
+                publishEvent(CacheEventType.COLLECTED, key, null);
             }
         } finally {
-            stripedLock.unlockAll();
+            segment.getLock().unlockWrite(stamp);
         }
     }
 
@@ -328,8 +406,15 @@ public class BoundedLocalCache<K, V> implements Cache<K, V> {
             reschedule(node, newExpireAt);
         }
 
-        hitCount.increment();
-        return node.getValue();  // VarHandle getAcquire
+        if (!isExpired(node, now) && !node.isValueCollected()) {
+            hitCount.increment();
+            // 可选：发布READ事件（注意性能影响）
+            // publishEvent(CacheEventType.READ, key, node.getValue());
+            return node.getValue();
+        }
+
+        missCount.increment();
+        return null;
     }
 
     /**
@@ -363,23 +448,31 @@ public class BoundedLocalCache<K, V> implements Cache<K, V> {
                 }
             }
         }
+
+        // 发布写入事件
+        publishEvent(CacheEventType.WRITE, key, value);
     }
 
     @Override
     public void invalidate(K key) {
         LocalCacheSegment<K, V> segment = segmentFor(key);
         Node<K, V> node = segment.removeNode(key);
+
         if (node != null) {
+            V value = node.getValue(); // 获取值用于事件通知
+
             if (timerWheel != null) {
                 synchronized (node) {
                     timerWheel.cancel(node);
                 }
             }
+
             // 如果是引用类型，主动清理引用
             ManualReference<V> ref = node.getValueReference();
-            if (ref != null) {
-                ref.clear();
-            }
+            if (ref != null) { ref.clear(); }
+
+            // 发布移除事件（显式删除）
+            publishEvent(CacheEventType.REMOVE, key, value);
         }
     }
 
@@ -390,11 +483,16 @@ public class BoundedLocalCache<K, V> implements Cache<K, V> {
 
         long now = System.currentTimeMillis();
         if (isExpired(node, now)) {
+            V value = node.getValue();
             if (segment.removeNode(key, node)) {
                 expireCount.increment();
+
                 // 清理引用
                 ManualReference<V> ref = node.getValueReference();
                 if (ref != null) ref.clear();
+
+                // 发布过期事件
+                publishEvent(CacheEventType.EXPIRE, key, value);
             }
         }
     }
@@ -435,7 +533,36 @@ public class BoundedLocalCache<K, V> implements Cache<K, V> {
 
     @Override
     public void invalidateAll() {
-        // 无需全局加锁，逐个 segment 清理，减少锁竞争
+        // 收集所有条目用于事件通知（在清理前）
+        if (enableEvents) {
+            List<CacheEvent<K, V>> events = new ArrayList<>();
+            long now = System.currentTimeMillis();
+
+            stripedLock.lockAll();
+            try {
+                for (LocalCacheSegment<K, V> segment : segments) {
+                    segment.getMap().forEach((k, node) -> {
+                        if (!isExpired(node, now) && !node.isValueCollected()) {
+                            V value = node.getValue();
+                            if (value != null) {
+                                events.add(CacheEvent.<K, V>builder()
+                                        .type(CacheEventType.REMOVE)
+                                        .key(k)
+                                        .value(value)
+                                        .build());
+                            }
+                        }
+                    });
+                }
+            } finally {
+                stripedLock.unlockAll();
+            }
+
+            // 发布事件（批量）
+            events.forEach(e -> publishEvent(e.getType(), e.getKey(), e.getValue()));
+        }
+
+        // 执行实际清理
         for (LocalCacheSegment<K, V> segment : segments) {
             segment.processSafelyWrite(map -> {
                 map.values().forEach(node -> {
@@ -492,5 +619,14 @@ public class BoundedLocalCache<K, V> implements Cache<K, V> {
     public void shutdown() {
         if (timerWheel != null) timerWheel.shutdown();
         if (memorySensitive) cleanupSoftReferences();
+
+        // 等待事件处理完成（简单实现：休眠一段时间）
+        if (enableEvents) {
+            try {
+                Thread.sleep(100);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
     }
 }

@@ -13,8 +13,8 @@ public class HierarchicalTimerWheel<K, V> {
         void onExpired(K key);
     }
 
-    private static final int[] WHEEL_SIZE = {60, 60, 24};
-    private static final long[] TICK_MS = {1000, 60*1000, 60*60*1000};
+    private static final int[] WHEEL_SIZE = {10, 60, 24};// 10*100ms=1s, 60*1m=1h, 24*1h=1d
+    private static final long[] TICK_MS = {100, 60*1000, 60*60*1000};// 100ms, 1min, 1hour
 
     private final List<TimerBucket<K, V>[]> wheels;
     private volatile long currentTime;
@@ -71,7 +71,7 @@ public class HierarchicalTimerWheel<K, V> {
                 advanceClock();
             }
 
-            long sleepMs = 1000 - (System.currentTimeMillis() - start);
+            long sleepMs = 100 - (System.currentTimeMillis() - start);
             if (sleepMs > 0) {
                 LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(sleepMs));
             }
@@ -79,7 +79,7 @@ public class HierarchicalTimerWheel<K, V> {
     }
 
     private void advanceClock() {
-        currentTime += 1000;
+        currentTime += 100;
         int secondSlot = calculateSlot(currentTime, 0);
 
         List<Node<K, V>> expired = wheels.get(0)[secondSlot].clearAndGet();

@@ -64,7 +64,7 @@ public class Node<K, V> {
             VALUE_HANDLE.setRelease(this, value);
         } else {
             // 弱/软引用：包装为 ManualReference
-            ManualReference<V> ref = new ManualReference<>(value, refQueue, strength);
+            ManualReference<V> ref = new ManualReference<>(key, value, refQueue, strength);
             VALUE_HANDLE.setRelease(this, ref);
             ref.setCleanupCallback(() -> this.expireAt = 0);
         }
@@ -113,7 +113,7 @@ public class Node<K, V> {
             VALUE_HANDLE.setRelease(this, value);
         } else {
             // 软/弱引用：创建新引用，使用 storeStoreFence 确保顺序
-            ManualReference<V> newRef = new ManualReference<>(value, refQueue, valueStrength);
+            ManualReference<V> newRef = new ManualReference<>(key, value, refQueue, valueStrength);
             ManualReference<V> oldRef = (ManualReference<V>) VALUE_HANDLE.getAcquire(this);
 
             VALUE_HANDLE.setRelease(this, newRef);
