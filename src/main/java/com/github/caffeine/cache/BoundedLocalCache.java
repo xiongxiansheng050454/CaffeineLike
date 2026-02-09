@@ -1,6 +1,7 @@
 package com.github.caffeine.cache;
 
 import com.github.caffeine.CacheUtils;
+import com.github.caffeine.cache.concurrent.AsyncRemovalProcessor;
 import com.github.caffeine.cache.concurrent.CacheEventRingBuffer;
 import com.github.caffeine.cache.event.CacheEvent;
 import com.github.caffeine.cache.event.CacheEventType;
@@ -13,7 +14,6 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
-import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.concurrent.locks.LockSupport;
@@ -62,6 +62,10 @@ public class BoundedLocalCache<K, V> implements Cache<K, V> {
     private final Consumer<CacheEvent<K, V>> statsListener;
     private final boolean enableEvents;
 
+    // 新增：异步RemovalListener处理器（可选）
+    private final AsyncRemovalProcessor<K, V> asyncRemovalProcessor;
+    private final boolean asyncRemovalEnabled;
+
     @SuppressWarnings("unchecked")
     public BoundedLocalCache(Caffeine<K, V> builder) {
         this.builder = builder;
@@ -103,6 +107,26 @@ public class BoundedLocalCache<K, V> implements Cache<K, V> {
         } else {
             this.eventBuffer = null;
         }
+
+        // ===== 初始化异步处理器 =====
+        if (builder.isAsyncRemovalEnabled() && removalListener != null) {
+            this.asyncRemovalEnabled = true;
+            // 包装为批量消费者
+            this.asyncRemovalProcessor = new AsyncRemovalProcessor<>(
+                    builder.getAsyncBufferSize(),      // 默认65536
+                    builder.getAsyncBatchSize(),       // 默认100
+                    builder.getAsyncFlushIntervalMs(), // 默认50ms
+                    events -> {
+                        // 批量回调给原始RemovalListener
+                        events.forEach(removalListener::accept);
+                    }
+            );
+            this.asyncRemovalProcessor.start();
+        } else {
+            this.asyncRemovalEnabled = false;
+            this.asyncRemovalProcessor = null;
+        }
+        // ======================================
 
         // 初始化引用队列（如果启用弱/软引用）
         if (usesReferences) {
@@ -146,30 +170,56 @@ public class BoundedLocalCache<K, V> implements Cache<K, V> {
     }
 
     /**
-     * 发布事件 - 非阻塞，失败不抛异常
+     * 发布事件 - 整合异步RemovalListener逻辑
+     * 关键修改：Removal事件优先走异步通道，其他事件走原有eventBuffer
      */
     private void publishEvent(CacheEventType type, K key, V value) {
-        if (!enableEvents || eventBuffer == null) return;
+
+        // 只有Removal相关事件（EVICT/EXPIRE/REMOVE/COLLECTED）走异步通道
+        boolean isRemovalEvent = (type == CacheEventType.EVICT ||
+                type == CacheEventType.EXPIRE ||
+                type == CacheEventType.REMOVE ||
+                type == CacheEventType.COLLECTED);
+
+        // 1. 如果启用了异步Removal且是Removal事件
+        if (asyncRemovalEnabled && isRemovalEvent && asyncRemovalProcessor != null) {
+            CacheEvent<K, V> event = CacheEvent.<K, V>builder()
+                    .type(type)
+                    .key(key)
+                    .value(value)
+                    .build();
+
+            // 尝试异步发布（非阻塞）
+            boolean success = asyncRemovalProcessor.publish(event);
+
+            if (!success) {
+                // 背压回退：同步执行（避免事件丢失）
+                asyncRemovalProcessor.fallbackProcess(event);
+            }
+            return; // 异步路径完成，不再走原有eventBuffer
+        }
+
+        // 2. 原有逻辑：同步Removal或其他事件（STATS等）
+        if (removalListener != null && isRemovalEvent) {
+            // 同步模式
+            CacheEvent<K, V> event = CacheEvent.<K, V>builder()
+                    .type(type)
+                    .key(key)
+                    .value(value)
+                    .build();
+            removalListener.accept(event);
+        }
+
+        if (!enableEvents || eventBuffer == null || isRemovalEvent) return;
 
         // 只有驱逐、过期、删除事件强制确保送达，其他事件可能丢弃
-        boolean critical = (type == CacheEventType.EVICT ||
-                type == CacheEventType.EXPIRE ||
-                type == CacheEventType.REMOVE);
-
         CacheEvent<K, V> event = CacheEvent.<K, V>builder()
                 .type(type)
                 .key(key)
                 .value(value)
                 .build();
 
-        boolean success = eventBuffer.publish(event);
-
-        if (!success && critical) {
-            // 关键事件失败时同步执行（类似Caffeine的同步回退）
-            if (removalListener != null) {
-                removalListener.accept(event);
-            }
-        }
+        eventBuffer.publish(event);
     }
 
     /**
@@ -617,9 +667,6 @@ public class BoundedLocalCache<K, V> implements Cache<K, V> {
     }
 
     public void shutdown() {
-        if (timerWheel != null) timerWheel.shutdown();
-        if (memorySensitive) cleanupSoftReferences();
-
         // 等待事件处理完成（简单实现：休眠一段时间）
         if (enableEvents) {
             try {
@@ -628,5 +675,15 @@ public class BoundedLocalCache<K, V> implements Cache<K, V> {
                 Thread.currentThread().interrupt();
             }
         }
+
+        // 关键：等待异步RemovalProcessor完成
+        if (asyncRemovalProcessor != null) {
+            System.out.println("[Shutdown] 等待异步RemovalProcessor完成，已处理: " +
+                    asyncRemovalProcessor.getProcessedCount());
+            asyncRemovalProcessor.shutdown();
+        }
+
+        if (timerWheel != null) timerWheel.shutdown();
+        if (memorySensitive) cleanupSoftReferences();
     }
 }

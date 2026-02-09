@@ -28,6 +28,34 @@ public final class Caffeine<K, V> {
     private Consumer<CacheEvent<K, V>> removalListener;
     private Consumer<CacheEvent<K, V>> statsListener;
 
+    // 新增：异步RemovalListener配置
+    private boolean asyncRemovalEnabled = false;
+    private int asyncBufferSize = 65536;      // RingBuffer大小
+    private int asyncBatchSize = 100;         // 批量阈值
+    private long asyncFlushIntervalMs = 50;   // 超时flush（毫秒）
+
+    /**
+     * 启用异步RemovalListener（基于RingBuffer）
+     * 优势：主线程put/remove零阻塞，批量聚合提升吞吐量
+     */
+    public Caffeine<K, V> asyncRemoval() {
+        this.asyncRemovalEnabled = true;
+        return this;
+    }
+
+    /**
+     * 配置异步处理器参数（可选，使用默认值可不调用）
+     */
+    public Caffeine<K, V> asyncRemovalConfig(int bufferSize, int batchSize, long flushIntervalMs) {
+        this.asyncBufferSize = bufferSize;
+        this.asyncBatchSize = batchSize;
+        this.asyncFlushIntervalMs = flushIntervalMs;
+        this.asyncRemovalEnabled = true;
+        return this;
+    }
+
+
+
     /**
      * 启用内存敏感模式：当JVM堆内存不足时自动清理Soft引用
      * 仅当使用softValues()时有效
@@ -147,4 +175,10 @@ public final class Caffeine<K, V> {
     // Package-private getters
     Consumer<CacheEvent<K, V>> getRemovalListener() { return removalListener; }
     Consumer<CacheEvent<K, V>> getStatsListener() { return statsListener; }
+
+    // Package-private getters
+    boolean isAsyncRemovalEnabled() { return asyncRemovalEnabled; }
+    int getAsyncBufferSize() { return asyncBufferSize; }
+    int getAsyncBatchSize() { return asyncBatchSize; }
+    long getAsyncFlushIntervalMs() { return asyncFlushIntervalMs; }
 }
