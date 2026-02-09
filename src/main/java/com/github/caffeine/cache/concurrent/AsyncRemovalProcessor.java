@@ -1,6 +1,7 @@
 package com.github.caffeine.cache.concurrent;
 
 import com.github.caffeine.cache.event.CacheEvent;
+import jdk.internal.vm.annotation.Contended;
 
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
@@ -10,6 +11,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.LongAdder;
 import java.util.concurrent.locks.LockSupport;
 import java.util.function.Consumer;
 
@@ -55,9 +57,11 @@ public class AsyncRemovalProcessor<K, V> {
     private final AtomicBoolean running = new AtomicBoolean(false);
     private final AtomicBoolean shutdown = new AtomicBoolean(false);
 
-    // 统计信息（使用LongAdder避免伪共享，但这里简化用volatile）
-    private volatile long droppedEvents = 0;
-    private volatile long processedEvents = 0;
+    // 统计信息（使用LongAdder避免伪共享）
+    @Contended  // 避免伪共享
+    private final LongAdder droppedEvents = new LongAdder();
+    @Contended
+    private final LongAdder processedEvents = new LongAdder();
 
     public AsyncRemovalProcessor(
             int bufferSize,           // RingBuffer容量（2的幂）
@@ -209,7 +213,7 @@ public class AsyncRemovalProcessor<K, V> {
     private void flush(List<CacheEvent<K, V>> events) {
         try {
             batchListener.accept(new ArrayList<>(events)); // 防御性拷贝
-            processedEvents += events.size();
+            processedEvents.add(events.size()); // 批量添加
         } catch (Exception e) {
             // 监听器异常不应影响缓存主流程
             System.err.println("[AsyncRemoval] Listener error: " + e.getMessage());
@@ -222,7 +226,7 @@ public class AsyncRemovalProcessor<K, V> {
      * 同步回退处理 - 当RingBuffer满时直接执行（避免事件丢失）
      */
     public void fallbackProcess(CacheEvent<K, V> event) {
-        droppedEvents++;
+        droppedEvents.increment(); // 原子递增
         List<CacheEvent<K, V>> single = new ArrayList<>(1);
         single.add(event);
         try {
@@ -232,6 +236,6 @@ public class AsyncRemovalProcessor<K, V> {
         }
     }
 
-    public long getProcessedCount() { return processedEvents; }
-    public long getDroppedCount() { return droppedEvents; }
+    public long getProcessedCount() { return processedEvents.sum(); }
+    public long getDroppedCount() { return droppedEvents.sum(); }
 }

@@ -3,6 +3,7 @@ package com.github.caffeine.cache;
 import com.github.caffeine.CacheUtils;
 import com.github.caffeine.cache.concurrent.AsyncRemovalProcessor;
 import com.github.caffeine.cache.concurrent.CacheEventRingBuffer;
+import com.github.caffeine.cache.concurrent.WriteBuffer;
 import com.github.caffeine.cache.event.CacheEvent;
 import com.github.caffeine.cache.event.CacheEventType;
 import com.github.caffeine.cache.reference.ManualReference;
@@ -66,6 +67,10 @@ public class BoundedLocalCache<K, V> implements Cache<K, V> {
     private final AsyncRemovalProcessor<K, V> asyncRemovalProcessor;
     private final boolean asyncRemovalEnabled;
 
+    // 新增：写缓冲（可选，仅当配置时初始化）
+    private final WriteBuffer<K, V> writeBuffer;
+    private final boolean bufferingEnabled;
+
     @SuppressWarnings("unchecked")
     public BoundedLocalCache(Caffeine<K, V> builder) {
         this.builder = builder;
@@ -128,6 +133,22 @@ public class BoundedLocalCache<K, V> implements Cache<K, V> {
         }
         // ======================================
 
+        // 初始化写缓冲系统
+        if (builder.isWriteBufferEnabled()) {
+            this.bufferingEnabled = true;
+            this.writeBuffer = new WriteBuffer<>(
+                    builder.getWriteBufferSize(),      // 默认65536
+                    builder.getWriteBufferMergeSize(), // 默认1024
+                    builder.getWriteBufferBatchSize(), // 默认100
+                    builder.getWriteBufferFlushMs(),   // 默认10ms
+                    this::doPutInternal,               // 实际写入函数
+                    this::publishEvent                 // 事件发布函数（避免重复发布）
+            );
+        } else {
+            this.bufferingEnabled = false;
+            this.writeBuffer = null;
+        }
+
         // 初始化引用队列（如果启用弱/软引用）
         if (usesReferences) {
             this.referenceQueue = new ManualReferenceQueue<>();
@@ -167,6 +188,68 @@ public class BoundedLocalCache<K, V> implements Cache<K, V> {
             timeTicker.setDaemon(true);
             timeTicker.start();
         }
+    }
+
+    /**
+     * 实际写入主存的逻辑（由WriteBuffer回调）
+     */
+    private void doPutInternal(K key, V value) {
+        if (value == null) {
+            // 删除操作
+            doInvalidateInternal(key);
+            return;
+        }
+
+        long now = System.currentTimeMillis();
+        LocalCacheSegment<K, V> segment = segmentFor(key);
+
+        // 关键修复：检查现有节点是否已过期，避免 WriteBuffer 延迟写入导致"复活"
+        Node<K, V> existingNode = segment.getNode(key);
+        if (existingNode != null && isExpired(existingNode, now)) {
+            // 清理过期节点
+            if (segment.removeNode(key, existingNode)) {
+                expireCount.increment();
+                if (timerWheel != null) {
+                    synchronized (existingNode) {
+                        timerWheel.cancel(existingNode);
+                    }
+                }
+                ManualReference<V> ref = existingNode.getValueReference();
+                if (ref != null) ref.clear();
+            }
+        }
+
+        long expireAt = calculateExpireAt(now);
+        ReferenceStrength strength = builder.valueStrength();
+
+        Node<K, V> newNode = new Node<>(key, value, now, expireAt, strength,
+                usesReferences ? referenceQueue : null);
+
+        Node<K, V> oldNode = segment.putNode(key, newNode);
+
+        if (timerWheel != null) {
+            if (oldNode != null) {
+                synchronized (oldNode) {
+                    timerWheel.cancel(oldNode);
+                    ManualReference<V> oldRef = oldNode.getValueReference();
+                    if (oldRef != null) oldRef.clear();
+                }
+            }
+            if (expireAt > 0) {
+                long delayMs = expireAt - now;
+                synchronized (newNode) {
+                    timerWheel.schedule(newNode, Math.max(1, delayMs));
+                }
+            }
+        }
+    }
+
+    /**
+     * 适配 WriteBuffer 的事件发布接口
+     */
+    private void publishEvent(CacheEvent<K, V> event) {
+        if (event == null) return;
+        publishEvent(event.getType(), event.getKey(), event.getValue());
     }
 
     /**
@@ -245,6 +328,8 @@ public class BoundedLocalCache<K, V> implements Cache<K, V> {
                         ManualReference<V> ref = node.getValueReference();
                         if (ref != null && !ref.isCleared()) {
                             ref.clear();
+                            // 发布事件，让异步处理器统计
+                            publishEvent(CacheEventType.COLLECTED, entry.getKey(), null);
                         }
                         iterator.remove();
                         cleaned++;
@@ -255,6 +340,7 @@ public class BoundedLocalCache<K, V> implements Cache<K, V> {
             stripedLock.unlockAll();
         }
         if (cleaned > 0) {
+            collectedCount.add(cleaned); // 使用 add 替代 increment
             System.out.println("[Memory] 紧急清理Soft引用: " + cleaned + " 条");
         }
     }
@@ -416,6 +502,28 @@ public class BoundedLocalCache<K, V> implements Cache<K, V> {
      */
     @Override
     public V getIfPresent(K key) {
+        long now = cachedTime;
+
+        if (bufferingEnabled) {
+            // 第一重检查：是否是待删除状态
+            if (writeBuffer.isPendingDelete(key)) {
+                return null;
+            }
+
+            // 查询待写入的值（如果存在且未过期）
+            V pending = writeBuffer.getPending(key, now);
+            if (pending != null) {
+                return pending;
+            }
+
+            // 关键修复：pending 为 null 可能是因为：
+            // 1. 缓冲中没有该key  2. 该key是待删除状态（value=null）
+            // 由于上面的 isPendingDelete 可能有竞态，这里需要二次确认
+            if (writeBuffer.isPendingDelete(key)) {
+                return null;
+            }
+        }
+
         LocalCacheSegment<K, V> segment = segmentFor(key);
         Node<K, V> node = segment.getNode(key);
 
@@ -432,10 +540,9 @@ public class BoundedLocalCache<K, V> implements Cache<K, V> {
             return null;
         }
 
-        // 使用缓存时间而非实时时间（允许 100ms 误差）
-        long now = cachedTime;
-
-        if (isExpired(node, now)) {
+        // 使用实时时间检查过期（cachedTime 可能有 100ms 误差）
+        long realNow = System.currentTimeMillis();
+        if (isExpired(node, realNow)) {
             if (segment.removeNode(key, node)) {
                 expireCount.increment();
                 if (timerWheel != null) {
@@ -450,21 +557,14 @@ public class BoundedLocalCache<K, V> implements Cache<K, V> {
 
         // 处理 expireAfterAccess：使用 VarHandle lazySet 更新时间戳
         if (builder.expiresAfterAccess()) {
-            long newExpireAt = now + TimeUnit.NANOSECONDS.toMillis(builder.expireAfterAccessNanos);
-            node.setAccessTime(now);        // setRelease
+            long newExpireAt = realNow + TimeUnit.NANOSECONDS.toMillis(builder.expireAfterAccessNanos);
+            node.setAccessTime(realNow);        // setRelease
             node.setExpireAt(newExpireAt);  // setRelease
             reschedule(node, newExpireAt);
         }
 
-        if (!isExpired(node, now) && !node.isValueCollected()) {
-            hitCount.increment();
-            // 可选：发布READ事件（注意性能影响）
-            // publishEvent(CacheEventType.READ, key, node.getValue());
-            return node.getValue();
-        }
-
-        missCount.increment();
-        return null;
+        hitCount.increment();
+        return node.getValue();
     }
 
     /**
@@ -472,56 +572,53 @@ public class BoundedLocalCache<K, V> implements Cache<K, V> {
      */
     @Override
     public void put(K key, V value) {
-        LocalCacheSegment<K, V> segment = segmentFor(key);
         long now = System.currentTimeMillis();
         long expireAt = calculateExpireAt(now);
-        ReferenceStrength strength = builder.valueStrength();
 
-        // 创建节点（构造函数内部使用 setRelease）
-        Node<K, V> newNode = new Node<>(key, value, now, expireAt, strength,
-                usesReferences ? referenceQueue : null);
-
-        Node<K, V> oldNode = segment.putNode(key, newNode);
-
-        if (timerWheel != null) {
-            if (oldNode != null) {
-                synchronized (oldNode) {
-                    timerWheel.cancel(oldNode);
-                    ManualReference<V> oldRef = oldNode.getValueReference();
-                    if (oldRef != null) oldRef.clear();
-                }
-            }
-            if (expireAt > 0) {
-                long delayMs = expireAt - now;
-                synchronized (newNode) {
-                    timerWheel.schedule(newNode, Math.max(1, delayMs));
-                }
-            }
+        if (!bufferingEnabled) {
+            // 直接模式
+            doPutInternal(key, value);
+            publishEvent(CacheEventType.WRITE, key, value);
+            return;
         }
 
-        // 发布写入事件
-        publishEvent(CacheEventType.WRITE, key, value);
+        // 缓冲模式：尝试写入RingBuffer
+        boolean accepted = writeBuffer.submit(key, value, CacheEventType.WRITE, expireAt);
+
+        if (!accepted) {
+            // 背压：直接写入（降级）
+            doPutInternal(key, value);
+            publishEvent(CacheEventType.WRITE, key, value);
+        }
     }
 
     @Override
     public void invalidate(K key) {
+        if (bufferingEnabled) {
+            boolean accepted = writeBuffer.submit(key, null, CacheEventType.REMOVE, -1);
+            if (!accepted) {
+                // 背压：直接执行，同时清理写缓冲中的该key（防止旧值覆盖）
+                writeBuffer.removePending(key); // 需要新增此方法
+                doInvalidateInternal(key);
+            }
+            return;
+        }
+        doInvalidateInternal(key);
+    }
+
+    // 提取实际删除逻辑
+    private void doInvalidateInternal(K key) {
         LocalCacheSegment<K, V> segment = segmentFor(key);
         Node<K, V> node = segment.removeNode(key);
-
         if (node != null) {
-            V value = node.getValue(); // 获取值用于事件通知
-
+            V value = node.getValue();
             if (timerWheel != null) {
                 synchronized (node) {
                     timerWheel.cancel(node);
                 }
             }
-
-            // 如果是引用类型，主动清理引用
             ManualReference<V> ref = node.getValueReference();
-            if (ref != null) { ref.clear(); }
-
-            // 发布移除事件（显式删除）
+            if (ref != null) ref.clear();
             publishEvent(CacheEventType.REMOVE, key, value);
         }
     }
@@ -667,6 +764,11 @@ public class BoundedLocalCache<K, V> implements Cache<K, V> {
     }
 
     public void shutdown() {
+
+        if (writeBuffer != null) {
+            writeBuffer.shutdown();
+        }
+
         // 等待事件处理完成（简单实现：休眠一段时间）
         if (enableEvents) {
             try {
@@ -685,5 +787,28 @@ public class BoundedLocalCache<K, V> implements Cache<K, V> {
 
         if (timerWheel != null) timerWheel.shutdown();
         if (memorySensitive) cleanupSoftReferences();
+    }
+
+    // 添加统计接口
+    public double getWriteBufferMergeRate() {
+        return bufferingEnabled ? writeBuffer.getMergeRate() : 0.0;
+    }
+
+    public WriteBufferStats getWriteBufferStats() {
+        if (!bufferingEnabled) return null;
+        return new WriteBufferStats(
+                writeBuffer.getSubmittedCount(),
+                writeBuffer.getMergedCount(),
+                writeBuffer.getFlushedCount()
+        );
+    }
+
+    public record WriteBufferStats(long submitted, long merged, long flushed) {
+        @Override
+        public String toString() {
+            return String.format("WriteBuffer[submitted=%d, merged=%d, flushed=%d, mergeRate=%.2f%%]",
+                    submitted, merged, flushed,
+                    submitted == 0 ? 0 : 100.0 * merged / submitted);
+        }
     }
 }

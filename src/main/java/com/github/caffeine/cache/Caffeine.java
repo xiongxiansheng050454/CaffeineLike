@@ -83,6 +83,12 @@ public final class Caffeine<K, V> {
     double getWarningThreshold() { return memoryWarningThreshold; }
     double getEmergencyThreshold() { return memoryEmergencyThreshold; }
 
+    private boolean writeBufferEnabled = false;
+    private int writeBufferSize = 65536;
+    private int writeBufferMergeSize = 1024;
+    private int writeBufferBatchSize = 100;
+    private long writeBufferFlushMs = 10;
+
     private Caffeine() {}
 
     public static <K, V> Caffeine<K, V> newBuilder() {
@@ -149,6 +155,20 @@ public final class Caffeine<K, V> {
         return this;
     }
 
+    // 启用写缓冲
+    public Caffeine<K, V> enableWriteBuffer() {
+        this.writeBufferEnabled = true;
+        return this;
+    }
+
+    public Caffeine<K, V> writeBufferConfig(int bufferSize, int mergeSize, int batchSize, long flushMs) {
+        this.writeBufferSize = bufferSize;
+        this.writeBufferMergeSize = mergeSize;
+        this.writeBufferBatchSize = batchSize;
+        this.writeBufferFlushMs = flushMs;
+        return this;
+    }
+
     public <K1 extends K, V1 extends V> Cache<K1, V1> build() {
         return (Cache<K1, V1>)new BoundedLocalCache<>(this);
     }
@@ -181,4 +201,11 @@ public final class Caffeine<K, V> {
     int getAsyncBufferSize() { return asyncBufferSize; }
     int getAsyncBatchSize() { return asyncBatchSize; }
     long getAsyncFlushIntervalMs() { return asyncFlushIntervalMs; }
+
+    // Package-private getters
+    boolean isWriteBufferEnabled() { return writeBufferEnabled; }
+    int getWriteBufferSize() { return writeBufferSize; }
+    int getWriteBufferMergeSize() { return writeBufferMergeSize; }
+    int getWriteBufferBatchSize() { return writeBufferBatchSize; }
+    long getWriteBufferFlushMs() { return writeBufferFlushMs; }
 }

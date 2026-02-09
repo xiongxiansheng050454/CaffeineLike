@@ -192,8 +192,13 @@ public class Node<K, V> {
     public void detachFromTimerWheel() {
         Node<K, V> prev = this.prevInTimerWheel;
         Node<K, V> next = this.nextInTimerWheel;
-        if (prev != null) prev.setNextInTimerWheel(next);
-        if (next != null) next.setPrevInTimerWheel(prev);
+
+        if (prev != null && next != null && prev != this && next != this) {
+            // 标准的双向链表摘除
+            prev.setNextInTimerWheel(next);
+            next.setPrevInTimerWheel(prev);
+        }
+        // 清空指针，帮助 GC
         this.prevInTimerWheel = null;
         this.nextInTimerWheel = null;
     }
