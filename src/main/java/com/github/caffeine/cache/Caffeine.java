@@ -89,6 +89,9 @@ public final class Caffeine<K, V> {
     private int writeBufferBatchSize = 100;
     private long writeBufferFlushMs = 10;
 
+    // 新增字段
+    private boolean recordFrequency = false;  // 启用频率统计
+
     private Caffeine() {}
 
     public static <K, V> Caffeine<K, V> newBuilder() {
@@ -101,9 +104,11 @@ public final class Caffeine<K, V> {
         return this;
     }
 
+    // 新增：启用W-TinyLFU频率统计（与maximumSize配合使用）
     public Caffeine<K, V> maximumSize(long maximumSize) {
         if (maximumSize < 0) throw new IllegalArgumentException();
         this.maximumSize = maximumSize;
+        this.recordFrequency = true;  // 启用大小限制时自动启用频率统计
         return this;
     }
 
@@ -208,4 +213,8 @@ public final class Caffeine<K, V> {
     int getWriteBufferMergeSize() { return writeBufferMergeSize; }
     int getWriteBufferBatchSize() { return writeBufferBatchSize; }
     long getWriteBufferFlushMs() { return writeBufferFlushMs; }
+
+    // 包级访问方法
+    boolean recordsFrequency() { return recordFrequency; }
+    long getMaximumSize() { return maximumSize; }
 }

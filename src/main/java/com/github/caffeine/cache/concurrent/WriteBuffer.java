@@ -245,6 +245,11 @@ public class WriteBuffer<K, V> {
         }
     }
 
+    public long getPendingCount() {
+        // mergeWindow 大小 + RingBuffer 中未消费的数量
+        return mergeWindow.size() + (writeSeq - readSeq);
+    }
+
     @SuppressWarnings("unchecked")
     private int drainTo(List<WriteTask<K, V>> container, int maxElements) {
         long currentRead = (long) READ_SEQ.getAcquire(this);

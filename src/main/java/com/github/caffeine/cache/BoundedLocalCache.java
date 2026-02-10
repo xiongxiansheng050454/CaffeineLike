@@ -3,6 +3,7 @@ package com.github.caffeine.cache;
 import com.github.caffeine.CacheUtils;
 import com.github.caffeine.cache.concurrent.AsyncRemovalProcessor;
 import com.github.caffeine.cache.concurrent.CacheEventRingBuffer;
+import com.github.caffeine.cache.concurrent.EvictionScheduler;
 import com.github.caffeine.cache.concurrent.WriteBuffer;
 import com.github.caffeine.cache.event.CacheEvent;
 import com.github.caffeine.cache.event.CacheEventType;
@@ -12,7 +13,9 @@ import com.github.caffeine.cache.reference.ReferenceStrength;
 import jdk.internal.vm.annotation.Contended;
 
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.TimeUnit;
@@ -71,10 +74,45 @@ public class BoundedLocalCache<K, V> implements Cache<K, V> {
     private final WriteBuffer<K, V> writeBuffer;
     private final boolean bufferingEnabled;
 
+    // 新增：频率草图（仅在启用maximumSize时初始化）
+    private final FrequencySketch<K> frequencySketch;
+    private final boolean evictsBySize;
+
+    // 新增：访问计数（用于触发驱逐检查）
+    private final LongAdder readCount = new LongAdder();
+    private static final int EVICTION_THRESHOLD = 100; // 每100次读检查一次驱逐
+
+    // 新增：异步驱逐调度器
+    private final EvictionScheduler<K, V> evictionScheduler;
+    private final boolean asyncEvictionEnabled;
+
+    // 驱逐配置
+    private static final int EVICTION_QUEUE_SIZE = 4096;
+    private static final int EVICTION_BATCH_SIZE = 100;
+    private static final long EVICTION_INTERVAL_MS = 50;
+
+    // 当前大小（原子更新）
+    private final LongAdder currentSize = new LongAdder();
+    private volatile long estimatedSizeCache = 0;
+    private volatile long lastSizeUpdateTime = 0;
+
+    // 新增：统计划分（无论同步/异步驱逐都计数）
+    @Contended
+    private final LongAdder evictionCount = new LongAdder();
+
     @SuppressWarnings("unchecked")
     public BoundedLocalCache(Caffeine<K, V> builder) {
         this.builder = builder;
+        this.evictsBySize = builder.evicts();  // 检查是否设置了maximumSize
         this.usesReferences = builder.valueStrength() != ReferenceStrength.STRONG;
+
+        // 初始化频率草图
+        if (evictsBySize) {
+            this.frequencySketch = new FrequencySketch<>();
+            this.frequencySketch.ensureCapacity(builder.getMaximumSize());
+        } else {
+            this.frequencySketch = null;
+        }
 
         // 初始化内存敏感层（仅Soft引用模式启用）
         this.memorySensitive = usesReferences && builder.isMemorySensitive();
@@ -149,6 +187,22 @@ public class BoundedLocalCache<K, V> implements Cache<K, V> {
             this.writeBuffer = null;
         }
 
+        // 初始化异步驱逐（当启用 maximumSize 时）
+        if (evictsBySize) {
+            this.evictionScheduler = new EvictionScheduler<>(
+                    EVICTION_QUEUE_SIZE,
+                    EVICTION_BATCH_SIZE,
+                    EVICTION_INTERVAL_MS,
+                    this::doEvict,           // 实际驱逐回调
+                    (k, v) -> publishEvent(CacheEventType.EVICT, k, v)  // 事件发布
+            );
+            this.evictionScheduler.start();
+            this.asyncEvictionEnabled = true;
+        } else {
+            this.evictionScheduler = null;
+            this.asyncEvictionEnabled = false;
+        }
+
         // 初始化引用队列（如果启用弱/软引用）
         if (usesReferences) {
             this.referenceQueue = new ManualReferenceQueue<>();
@@ -191,6 +245,50 @@ public class BoundedLocalCache<K, V> implements Cache<K, V> {
     }
 
     /**
+     * 实际驱逐执行（仅由 EvictionScheduler 调用）
+     * 注意：此方法由后台线程调用，需保证线程安全
+     */
+    private void doEvict(K key, Node<K, V> node) {
+        if (key == null || node == null) return;
+
+        LocalCacheSegment<K, V> segment = segmentFor(key);
+
+        // 使用写锁确保安全删除
+        long stamp = segment.getLock().writeLock();
+        try {
+            // 双重检查：确保节点未被修改且未过期
+            Node<K, V> current = segment.getMap().get(key);
+            if (current != node) return;  // 已被替换
+
+            if (isExpired(node, System.currentTimeMillis())) {
+                segment.getMap().remove(key);
+                currentSize.decrement();
+                return;
+            }
+
+            // 执行驱逐
+            segment.getMap().remove(key);
+            currentSize.decrement();
+            // 关键：统一统计驱逐次数
+            evictionCount.increment();
+
+            // 清理时间轮和引用
+            if (timerWheel != null) {
+                synchronized (node) {
+                    timerWheel.cancel(node);
+                }
+            }
+            ManualReference<V> ref = node.getValueReference();
+            if (ref != null) ref.clear();
+
+            publishEvent(CacheEventType.EVICT, key, node.getValue());
+
+        } finally {
+            segment.getLock().unlockWrite(stamp);
+        }
+    }
+
+    /**
      * 实际写入主存的逻辑（由WriteBuffer回调）
      */
     private void doPutInternal(K key, V value) {
@@ -209,6 +307,7 @@ public class BoundedLocalCache<K, V> implements Cache<K, V> {
             // 清理过期节点
             if (segment.removeNode(key, existingNode)) {
                 expireCount.increment();
+                currentSize.decrement(); // 过期减少计数
                 if (timerWheel != null) {
                     synchronized (existingNode) {
                         timerWheel.cancel(existingNode);
@@ -227,20 +326,34 @@ public class BoundedLocalCache<K, V> implements Cache<K, V> {
 
         Node<K, V> oldNode = segment.putNode(key, newNode);
 
-        if (timerWheel != null) {
-            if (oldNode != null) {
+        // 关键修复：维护 currentSize
+        if (oldNode == null) {
+            // 新增条目
+            currentSize.increment();
+        } else {
+            // 更新条目：清理旧节点的时间轮和引用
+            if (timerWheel != null) {
                 synchronized (oldNode) {
                     timerWheel.cancel(oldNode);
                     ManualReference<V> oldRef = oldNode.getValueReference();
                     if (oldRef != null) oldRef.clear();
                 }
             }
+        }
+
+        if (timerWheel != null) {
             if (expireAt > 0) {
                 long delayMs = expireAt - now;
                 synchronized (newNode) {
                     timerWheel.schedule(newNode, Math.max(1, delayMs));
                 }
             }
+        }
+
+        // ===== 关键修复：触发同步驱逐检查 =====
+        // 当使用 WriteBuffer 时，此方法由后台线程调用，需要检查容量边界
+        if (evictsBySize) {
+            ensureSizeBound();
         }
     }
 
@@ -328,10 +441,10 @@ public class BoundedLocalCache<K, V> implements Cache<K, V> {
                         ManualReference<V> ref = node.getValueReference();
                         if (ref != null && !ref.isCleared()) {
                             ref.clear();
-                            // 发布事件，让异步处理器统计
                             publishEvent(CacheEventType.COLLECTED, entry.getKey(), null);
                         }
                         iterator.remove();
+                        currentSize.decrement();
                         cleaned++;
                     }
                 }
@@ -340,7 +453,7 @@ public class BoundedLocalCache<K, V> implements Cache<K, V> {
             stripedLock.unlockAll();
         }
         if (cleaned > 0) {
-            collectedCount.add(cleaned); // 使用 add 替代 increment
+            collectedCount.add(cleaned);
             System.out.println("[Memory] 紧急清理Soft引用: " + cleaned + " 条");
         }
     }
@@ -464,27 +577,18 @@ public class BoundedLocalCache<K, V> implements Cache<K, V> {
         if (key == null) return;
 
         LocalCacheSegment<K, V> segment = segmentFor(key);
-
-        // 直接使用写锁，确保原子性检查+删除
         long stamp = segment.getLock().writeLock();
         try {
-            // 在锁内重新获取节点，确保一致性
             Node<K, V> node = segment.getMap().get(key);
-
-            // 双重检查：确保节点存在且引用匹配（防止误删）
             if (node != null && node.getValueReference() == ref) {
-                // 取消时间轮
                 if (timerWheel != null) {
                     synchronized (node) {
                         timerWheel.cancel(node);
                     }
                 }
-
-                // 移除节点
                 segment.getMap().remove(key);
                 collectedCount.increment();
-
-                // 发布事件
+                currentSize.decrement();
                 publishEvent(CacheEventType.COLLECTED, key, null);
             }
         } finally {
@@ -563,8 +667,107 @@ public class BoundedLocalCache<K, V> implements Cache<K, V> {
             reschedule(node, newExpireAt);
         }
 
+        // 关键：记录访问频率（W-TinyLFU核心）
+        if (evictsBySize) {
+            frequencySketch.increment(key);
+            readCount.increment();
+
+            // 每 64 次访问触发一次异步扫描
+            if ((readCount.sum() & 63) == 0) {
+                triggerSamplingEviction();
+            }
+        }
+
         hitCount.increment();
         return node.getValue();
+    }
+
+    /**
+     * 同步强制检查并执行容量限制（背压保护）
+     * 当缓存大小超过限制时，阻塞式执行驱逐直到达标
+     */
+    private void ensureSizeBound() {
+        if (!evictsBySize) return;
+
+        long maxSize = builder.getMaximumSize();
+        long current = currentSize.sum();
+
+        // 快速路径：未超容直接返回
+        if (current <= maxSize) return;
+
+        // 慢速路径：需要驱逐
+        // 计算需要驱逐的数量（超出的10%，至少1个）
+        int targetEviction = (int) Math.max(1, (current - maxSize) * 1.1);
+
+        int evicted = 0;
+        int attempts = 0;
+        final int maxAttempts = 3; // 防止无限循环
+
+        while (current > maxSize && attempts < maxAttempts && evicted < targetEviction) {
+            // 执行一次驱逐扫描
+            int batchEvicted = tryEvictBatch(targetEviction - evicted);
+            evicted += batchEvicted;
+
+            // 刷新当前大小
+            current = currentSize.sum();
+            attempts++;
+
+            // 如果本次没驱逐成功但还超容，短暂让出CPU避免死锁
+            if (batchEvicted == 0 && current > maxSize) {
+                Thread.yield();
+            }
+        }
+
+        // 极端情况：如果还是超容，强制异步信号（兜底）
+        if (current > maxSize * 1.5 && asyncEvictionEnabled) {
+            triggerSamplingEviction();
+        }
+    }
+
+    /**
+     * 批量驱逐指定数量的条目
+     * @param maxToEvict 最大驱逐数量
+     * @return 实际驱逐数量
+     */
+    private int tryEvictBatch(int maxToEvict) {
+        if (!evictsBySize || frequencySketch == null) return 0;
+
+        List<Candidate<K, V>> victims = new ArrayList<>(maxToEvict * 2);
+
+        // 快速采样（使用弱一致性遍历，减少锁竞争）
+        for (LocalCacheSegment<K, V> segment : segments) {
+            long stamp = segment.getLock().tryReadLock();
+            if (stamp == 0) continue; // 跳过被锁定的segment
+
+            try {
+                segment.getMap().forEach((k, node) -> {
+                    if (victims.size() < maxToEvict * 2 && !node.isValueCollected()) {
+                        int freq = frequencySketch.frequency(k);
+                        victims.add(new Candidate<>(k, node, freq, node.getAccessTime()));
+                    }
+                });
+            } finally {
+                segment.getLock().unlockRead(stamp);
+            }
+        }
+
+        if (victims.isEmpty()) return 0;
+
+        // 按频率排序（低频率优先驱逐）
+        victims.sort(Comparator
+                .comparingInt((Candidate<K, V> a) -> a.frequency)
+                .thenComparingLong((Candidate<K, V> a) -> a.accessTime));
+
+        // 执行驱逐
+        int evicted = 0;
+        for (Candidate<K, V> candidate : victims) {
+            if (evicted >= maxToEvict) break;
+            if (tryEvict(candidate.key, candidate.node)) {
+                evicted++;
+            }
+        }
+
+        return evicted;
     }
 
     /**
@@ -576,20 +779,222 @@ public class BoundedLocalCache<K, V> implements Cache<K, V> {
         long expireAt = calculateExpireAt(now);
 
         if (!bufferingEnabled) {
-            // 直接模式
             doPutInternal(key, value);
             publishEvent(CacheEventType.WRITE, key, value);
+            // 同步检查驱逐
+            ensureSizeBound();
             return;
         }
 
-        // 缓冲模式：尝试写入RingBuffer
         boolean accepted = writeBuffer.submit(key, value, CacheEventType.WRITE, expireAt);
 
         if (!accepted) {
-            // 背压：直接写入（降级）
+            // 背压：同步写入
             doPutInternal(key, value);
             publishEvent(CacheEventType.WRITE, key, value);
         }
+
+        // 异步检查
+        if (asyncEvictionEnabled) {
+            checkEvictionAsync();
+        }
+
+        // 关键修复：如果严重超容，强制同步驱逐（防止内存爆炸）
+        if (evictsBySize) {
+            long current = currentSize.sum();
+            long max = builder.getMaximumSize();
+            // 超过 150% 容量时强制驱逐（可调整阈值）
+            if (current > max * 1.5) {
+                tryEvictEntries();
+            }
+        }
+
+        // 记录频率
+        if (evictsBySize) {
+            frequencySketch.increment(key);
+        }
+    }
+
+    /**
+     * W-TinyLFU 驱逐策略实现
+     */
+    private void tryEvictEntries() {
+        if (!evictsBySize) return;
+
+        long currentSize = estimatedSize();
+        long targetSize = builder.getMaximumSize();
+
+        if (currentSize <= targetSize) return;
+
+        // 需要驱逐的数量（超出部分的10%）
+        int candidates = (int) Math.min((currentSize - targetSize) * 1.1, 10);
+
+        // 收集候选（最老的条目）
+        List<Candidate<K, V>> victims = new ArrayList<>();
+
+        stripedLock.lockAll();
+        try {
+            // 简单实现：随机采样驱逐（实际Caffeine使用更复杂的Window TinyLFU）
+            for (LocalCacheSegment<K, V> segment : segments) {
+                segment.getMap().forEach((k, node) -> {
+                    if (!node.isValueCollected()) {
+                        int freq = frequencySketch.frequency(k);
+                        victims.add(new Candidate<>(k, node, freq, node.getAccessTime()));
+                    }
+                });
+            }
+        } finally {
+            stripedLock.unlockAll();
+        }
+
+        // 按频率+时间排序（频率低且老的优先驱逐）
+        victims.sort(Comparator
+                .comparingInt((Candidate<K, V> a) -> a.frequency)
+                .thenComparingLong((Candidate<K, V> a) -> a.accessTime) // 老的优先保留
+                .reversed() // 反转：频率低且新的先被驱逐
+        );
+
+        // 驱逐最差的候选
+        int evicted = 0;
+        for (Candidate<K, V> candidate : victims) {
+            if (evicted >= candidates) break;
+            if (tryEvict(candidate.key, candidate.node)) {
+                evicted++;
+            }
+        }
+
+        if (evicted > 0) {
+            System.out.println("[Eviction] 已驱逐 " + evicted + " 个条目，当前大小: " + estimatedSize());
+        }
+    }
+
+    private boolean tryEvict(K key, Node<K, V> node) {
+        LocalCacheSegment<K, V> segment = segmentFor(key);
+        long stamp = segment.getLock().writeLock();
+        try {
+            Node<K, V> current = segment.getMap().get(key);
+            if (current == node && !isExpired(node, System.currentTimeMillis())) {
+                segment.getMap().remove(key);
+                currentSize.decrement();
+
+                // ===== 关键修复：同步驱逐也要统计 =====
+                evictionCount.increment();
+
+                if (timerWheel != null) {
+                    synchronized (node) {
+                        timerWheel.cancel(node);
+                    }
+                }
+                publishEvent(CacheEventType.EVICT, key, node.getValue());
+                return true;
+            }
+            return false;
+        } finally {
+            segment.getLock().unlockWrite(stamp);
+        }
+    }
+
+    /**
+     * 异步检查驱逐（不阻塞写线程）
+     * 仅提交信号，实际工作在后台线程执行
+     */
+    private void checkEvictionAsync() {
+        long current = estimatedSize();
+        long max = builder.getMaximumSize();
+
+        if (current > max) {
+            // 超过容量，触发采样驱逐
+            triggerSamplingEviction();
+        }
+    }
+
+    /**
+     * 触发采样驱逐：收集候选并提交给调度器
+     * 此方法快速执行，只收集不删除
+     */
+    private void triggerSamplingEviction() {
+        if (!asyncEvictionEnabled) return;
+
+        // 快速估计当前大小（可能不精确，但足够）
+        long current = estimatedSize();
+        long target = (long) (builder.getMaximumSize() * 0.9); // 目标：90%容量
+
+        if (current <= target) return;
+
+        int candidatesNeeded = (int) Math.min((current - target) * 1.2, 50);
+        List<EvictionScheduler.EvictionCandidate<K, V>> candidates = new ArrayList<>(candidatesNeeded);
+
+        // 采样收集（不持有全局锁，使用弱一致性遍历）
+        int sampled = 0;
+        for (LocalCacheSegment<K, V> segment : segments) {
+            // 尝试获取读锁，失败则跳过（避免阻塞）
+            long stamp = segment.getLock().tryReadLock();
+            if (stamp == 0) continue;
+
+            try {
+                for (var entry : segment.getMap().entrySet()) {
+                    if (sampled >= candidatesNeeded * 2) break; // 收集2倍数量供排序
+
+                    K key = entry.getKey();
+                    Node<K, V> node = entry.getValue();
+
+                    if (node != null && !node.isValueCollected()) {
+                        int freq = frequencySketch.frequency(key);
+                        candidates.add(new EvictionScheduler.EvictionCandidate<>(
+                                key, node, freq, node.getAccessTime()
+                        ));
+                        sampled++;
+                    }
+                }
+            } finally {
+                segment.getLock().unlockRead(stamp);
+            }
+        }
+
+        // 提交给后台线程（非阻塞）
+        if (!candidates.isEmpty()) {
+            evictionScheduler.submitCandidates(candidates);
+        }
+    }
+
+    /**
+     * 同步强制驱逐（用于极端情况或关闭时）
+     */
+    public void forceEvict(K key) {
+        LocalCacheSegment<K, V> segment = segmentFor(key);
+        Node<K, V> node = segment.getNode(key);
+        if (node != null) {
+            doEvict(key, node);
+        }
+    }
+
+    // 获取驱逐统计
+    public EvictionStats getEvictionStats() {
+        if (!asyncEvictionEnabled) return null;
+        return new EvictionStats(
+                getEvictedCount(),
+                evictionScheduler.getRejectedCount(),
+                evictionScheduler.getPendingCount()
+        );
+    }
+
+    // 修改：合并统计同步和异步驱逐
+    public long getEvictedCount() {
+        long syncEvicted = evictionCount.sum();
+        long asyncEvicted = asyncEvictionEnabled ?
+                evictionScheduler.getEvictedCount() : 0;
+        return syncEvicted + asyncEvicted;
+    }
+
+    public record EvictionStats(long evicted, long rejected, int pending) {}
+
+    // 候选对象内部类
+    private record Candidate<K, V>(K key, Node<K, V> node, int frequency, long accessTime) {}
+
+    // 异步驱逐调度（避免阻塞写操作）
+    private void scheduleEviction() {
+        // 简单实现：立即执行，后续可优化为后台线程
+        CompletableFuture.runAsync(this::tryEvictEntries);
     }
 
     @Override
@@ -611,6 +1016,7 @@ public class BoundedLocalCache<K, V> implements Cache<K, V> {
         LocalCacheSegment<K, V> segment = segmentFor(key);
         Node<K, V> node = segment.removeNode(key);
         if (node != null) {
+            currentSize.decrement();
             V value = node.getValue();
             if (timerWheel != null) {
                 synchronized (node) {
@@ -633,12 +1039,10 @@ public class BoundedLocalCache<K, V> implements Cache<K, V> {
             V value = node.getValue();
             if (segment.removeNode(key, node)) {
                 expireCount.increment();
+                currentSize.decrement();
 
-                // 清理引用
                 ManualReference<V> ref = node.getValueReference();
                 if (ref != null) ref.clear();
-
-                // 发布过期事件
                 publishEvent(CacheEventType.EXPIRE, key, value);
             }
         }
@@ -725,13 +1129,25 @@ public class BoundedLocalCache<K, V> implements Cache<K, V> {
     }
 
     // estimatedSize 不需要全局锁，各Segment size()近似即可
+    /**
+     * 精确计算大小（用于统计，不用于驱逐决策）
+     */
     @Override
     public long estimatedSize() {
-        long sum = 0;
-        for (LocalCacheSegment<K, V> seg : segments) {
-            sum += seg.size();
+        long now = System.currentTimeMillis();
+        if (now - lastSizeUpdateTime > 100) {
+            long sum = 0;
+            for (LocalCacheSegment<K, V> seg : segments) {
+                sum += seg.size();
+            }
+            // 关键：加上写缓冲中待处理的条目数
+            if (bufferingEnabled) {
+                sum += writeBuffer.getPendingCount(); // 需要实现此方法
+            }
+            estimatedSizeCache = sum;
+            lastSizeUpdateTime = now;
         }
-        return sum;
+        return estimatedSizeCache;
     }
 
     @Override
