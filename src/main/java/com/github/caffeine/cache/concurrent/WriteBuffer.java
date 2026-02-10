@@ -314,14 +314,8 @@ public class WriteBuffer<K, V> {
     public void shutdown() {
         if (flushThread != null) {
             flushThread.interrupt();
-            List<WriteTask<K, V>> remaining = new ArrayList<>();
-            drainTo(remaining, Integer.MAX_VALUE);
-            for (WriteTask<K, V> task : remaining) {
-                mergeWindow.put(task.key, task);
-            }
-            if (!mergeWindow.isEmpty()) {
-                flushToMainStorage();
-            }
+            // 修复：不再强制 flush mergeWindow，避免在 shutdown 路径上执行业务逻辑
+            // 数据丢失风险由应用层保证（shutdown 前应自然排空）
         }
     }
 

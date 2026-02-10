@@ -15,10 +15,8 @@ import jdk.internal.vm.annotation.Contended;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentMap;
-import java.util.concurrent.TimeUnit;
+import java.util.Map;
+import java.util.concurrent.*;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.concurrent.locks.LockSupport;
 import java.util.function.Consumer;
@@ -27,7 +25,7 @@ public class BoundedLocalCache<K, V> implements Cache<K, V> {
     private final LocalCacheSegment<K, V>[] segments;
     private final int segmentMask;
     private final Caffeine<K, V> builder;
-    private final HierarchicalTimerWheel<K, V> timerWheel;
+    public final HierarchicalTimerWheel<K, V> timerWheel;
 
     // 新增：引用队列（仅当使用弱/软引用时初始化）
     private final ManualReferenceQueue<V> referenceQueue;
@@ -104,17 +102,33 @@ public class BoundedLocalCache<K, V> implements Cache<K, V> {
     private final WindowCache<K, V> windowCache;
     private final boolean useWindowCache; // 是否启用W-TinyLFU模式
 
+    // 在现有 windowCache 字段附近添加
+    private final MainCachePolicy<K, V> mainPolicy;
+    private final long mainMaximum;  // Main Cache 容量（总容量 - Window）
+
     @SuppressWarnings("unchecked")
     public BoundedLocalCache(Caffeine<K, V> builder) {
         this.builder = builder;
         this.evictsBySize = builder.evicts();  // 检查是否设置了maximumSize
         this.usesReferences = builder.valueStrength() != ReferenceStrength.STRONG;
 
-        // 初始化频率草图
+        // 初始化 Window Cache（1%）和 Main Policy（99%）
         if (evictsBySize) {
+            long totalSize = builder.getMaximumSize();
+            this.useWindowCache = true;
+            this.windowCache = new WindowCache<>(totalSize, this::promoteToMain);
+
+            // Main Cache 占 99%
+            this.mainMaximum = (long) (totalSize * 0.99);
+            this.mainPolicy = new MainCachePolicy<>(mainMaximum);
+
             this.frequencySketch = new FrequencySketch<>();
-            this.frequencySketch.ensureCapacity(builder.getMaximumSize());
+            this.frequencySketch.ensureCapacity(totalSize);
         } else {
+            this.useWindowCache = false;
+            this.windowCache = null;
+            this.mainPolicy = null;
+            this.mainMaximum = 0;
             this.frequencySketch = null;
         }
 
@@ -222,22 +236,12 @@ public class BoundedLocalCache<K, V> implements Cache<K, V> {
             segments[i] = new LocalCacheSegment<>();
         }
 
-        // StripedLock 仅用于需要全局锁的场景（如 invalidateAll）
         this.stripedLock = new StripedLock(segmentCount); // 用于全局遍历保护
 
         // 时间轮初始化
         this.timerWheel = (builder.expiresAfterWrite() || builder.expiresAfterAccess())
                 ? new HierarchicalTimerWheel<>(this::onTimerExpired)
                 : null;
-
-        // 初始化Window Cache（仅当启用size限制时）
-        if (evictsBySize) {
-            this.useWindowCache = true;
-            this.windowCache = new WindowCache<>(builder.getMaximumSize(), this::promoteToMain);
-        } else {
-            this.useWindowCache = false;
-            this.windowCache = null;
-        }
 
         // 关键：确保维护线程启动（合并引用队列+内存检查）
         if (usesReferences) {
@@ -257,19 +261,39 @@ public class BoundedLocalCache<K, V> implements Cache<K, V> {
         }
     }
 
-    /**
-     * Window区节点晋升到Main区的回调
-     * 简化版：直接放入主存储（完整版应经过TinyLFU准入判断）
-     */
-    private void promoteToMain(Node<K, V> node) {
-        if (!evictsBySize) return;
+    // 新增：用于收集晋升过程中需要驱逐的节点（避免锁重入死锁）
+    private final ThreadLocal<List<Node<K, V>>> pendingEvictions =
+            ThreadLocal.withInitial(ArrayList::new);
 
-        // 不获取锁，直接标记（安全：node已从Window移除，即使被替换也无影响）
+    // 修改晋升回调：收集需要驱逐的节点，而非立即执行
+    private void promoteToMain(Node<K, V> node) {
+        if (!evictsBySize || mainPolicy == null) return;
+
         node.setInWindow(false);
 
-        // 触发异步驱逐检查（如果Main区也满了）
-        if (asyncEvictionEnabled) {
-            checkEvictionAsync();
+        // 获取可能被驱逐的节点（如果 Protected 和 Probation 都满了）
+        Node<K, V> victim = mainPolicy.admitToProbation(node);
+
+        if (victim != null) {
+            // 先收集，在 Segment 锁外处理，避免死锁
+            pendingEvictions.get().add(victim);
+        }
+    }
+
+    /**
+     * 检查并驱逐 Main Cache 超出容量的部分
+     */
+    private void checkMainCacheEviction() {
+        if (mainPolicy == null) return;
+
+        long currentMainSize = mainPolicy.totalSize();
+        if (currentMainSize > mainMaximum) {
+            // 需要从 Probation 驱逐
+            Node<K, V> victim = mainPolicy.evictFromProbation();
+            if (victim != null) {
+                // 异步或同步驱逐
+                doEvict(victim.getKey(), victim);
+            }
         }
     }
 
@@ -353,21 +377,21 @@ public class BoundedLocalCache<K, V> implements Cache<K, V> {
         Node<K, V> newNode = new Node<>(key, value, now, expireAt, strength,
                 usesReferences ? referenceQueue : null);
 
+        // 用于收集需要在锁外驱逐的节点（避免死锁：防止在持有MainPolicy/Window锁时获取Segment锁）
+        List<Node<K, V>> victimsToEvict = new ArrayList<>(2);
+
         Node<K, V> oldNode = segment.putNode(key, newNode);
 
         // 关键修复：维护 currentSize
         if (oldNode == null) {
             // 新增条目
             currentSize.increment();
-        } else {
-            // 更新条目：清理旧节点的时间轮和引用
-            if (timerWheel != null) {
-                synchronized (oldNode) {
-                    timerWheel.cancel(oldNode);
-                    ManualReference<V> oldRef = oldNode.getValueReference();
-                    if (oldRef != null) oldRef.clear();
-                }
+            if (evictsBySize && useWindowCache) {
+                windowCache.admit(newNode);  // 注意：这里传入 newNode
             }
+        } else {
+            // 更新已有节点：清理旧状态，可能产生驱逐候选者
+            handleUpdate(oldNode, newNode, victimsToEvict);
         }
 
         if (timerWheel != null) {
@@ -379,20 +403,72 @@ public class BoundedLocalCache<K, V> implements Cache<K, V> {
             }
         }
 
-        // 新代码：使用Window Cache准入
+        // 新增：记录频率（W-TinyLFU核心）
         if (evictsBySize) {
-            if (oldNode == null && useWindowCache) {
-                // 新节点：进入Window区（而非直接进Main区）
-                windowCache.admit(newNode);
-            } else {
-                // 更新已有节点：检查Window区访问
-                if (useWindowCache && newNode.isInWindow()) {
-                    windowCache.onAccess(newNode);
-                }
-                // 触发驱逐检查
-                ensureSizeBound();
+            if (oldNode == null) {
+                frequencySketch.increment(key);
             }
         }
+
+        // 关键：处理驱逐候选者，避免死锁
+        // 注意：如果启用了异步驱逐，优先提交给后台线程，避免在MainPolicy锁后获取Segment锁导致死锁
+        if (!victimsToEvict.isEmpty()) {
+            if (asyncEvictionEnabled && evictionScheduler != null) {
+                // 异步提交，避免死锁（推荐做法）
+                for (Node<K, V> victim : victimsToEvict) {
+                    evictionScheduler.submitCandidate(
+                            victim.getKey(),
+                            victim,
+                            frequencySketch != null ? frequencySketch.frequency(victim.getKey()) : 0,
+                            victim.getAccessTime()
+                    );
+                }
+            } else {
+                // 同步驱逐（警告：如果此时其他线程持有Segment锁并等待MainPolicy锁，可能死锁）
+                // 生产环境建议启用 asyncEvictionEnabled
+                for (Node<K, V> victim : victimsToEvict) {
+                    doEvict(victim.getKey(), victim);
+                }
+            }
+        }
+
+        if (evictsBySize) {
+            ensureSizeBound();
+        }
+    }
+
+    /**
+     * 处理节点更新，收集需要驱逐的候选者（避免在锁内执行驱逐）
+     *
+     * @param victims 输出参数，用于收集 Probation 区满时被挤出的节点
+     */
+    private void handleUpdate(Node<K, V> oldNode, Node<K, V> newNode, List<Node<K, V>> victims) {
+        // 继承旧节点的队列状态
+        int oldType = oldNode.getQueueType();
+        newNode.setQueueType(oldType);
+
+        if (oldType == QueueType.WINDOW.value() && useWindowCache) {
+            // 替换 Window 中的节点引用（使用replace避免连续remove+admit导致的StampedLock重入）
+            windowCache.replace(oldNode, newNode);
+        } else if (mainPolicy != null &&
+                (oldType == QueueType.PROBATION.value() ||
+                        oldType == QueueType.PROTECTED.value())) {
+            // 从 Main Policy 中替换旧节点，新节点进入 Probation
+            // 返回的 victim 是 Probation 区满时被挤出的节点，需在锁外处理
+            Node<K, V> victim = mainPolicy.replaceToProbation(oldNode, newNode);
+            if (victim != null) {
+                victims.add(victim);
+            }
+        }
+
+        // 清理旧节点的时间轮和引用（与外部锁无关）
+        if (timerWheel != null) {
+            synchronized (oldNode) {
+                timerWheel.cancel(oldNode);
+            }
+        }
+        ManualReference<V> ref = oldNode.getValueReference();
+        if (ref != null) ref.clear();
     }
 
     /**
@@ -674,6 +750,27 @@ public class BoundedLocalCache<K, V> implements Cache<K, V> {
             return null;
         }
 
+        // 处理访问后的队列迁移
+        int queueType = node.getQueueType();
+
+        if (queueType == QueueType.WINDOW.value()) {
+            // Window 区访问：已在 WindowCache.onAccess 中处理 LRU
+            windowCache.onAccess(node);
+        }
+        else if (queueType == QueueType.PROBATION.value()) {
+            // Probation 区访问：尝试晋升到 Protected
+            int freq = frequencySketch.frequency(key);
+            Node<K, V> probationHead = mainPolicy.peekProbationHead();
+            int headFreq = (probationHead != null) ?
+                    frequencySketch.frequency(probationHead.getKey()) : 0;
+
+            mainPolicy.tryPromoteToProtected(node, freq, headFreq);
+        }
+        else if (queueType == QueueType.PROTECTED.value()) {
+            // Protected 区访问：LRU 维护
+            mainPolicy.onProtectedAccess(node);
+        }
+
         // 检查引用是否被清理（无锁读）
         if (node.isValueCollected()) {
             segment.removeNode(key);
@@ -850,11 +947,6 @@ public class BoundedLocalCache<K, V> implements Cache<K, V> {
             if (current > max * 1.5) {
                 tryEvictEntries();
             }
-        }
-
-        // 记录频率
-        if (evictsBySize) {
-            frequencySketch.increment(key);
         }
     }
 
@@ -1061,15 +1153,20 @@ public class BoundedLocalCache<K, V> implements Cache<K, V> {
         if (node != null) {
             currentSize.decrement();
             V value = node.getValue();
+            // 从对应的分区移除
+            if (useWindowCache && node.isInWindow()) {
+                windowCache.remove(node);
+            } else if (mainPolicy != null &&
+                    (node.isInProbation() || node.isInProtected())) {
+                mainPolicy.remove(node);
+            }
+
             if (timerWheel != null) {
                 synchronized (node) {
                     timerWheel.cancel(node);
                 }
             }
-            // 如果在Window区，先移除
-            if (useWindowCache && node.isInWindow()) {
-                windowCache.remove(node);
-            }
+
             ManualReference<V> ref = node.getValueReference();
             if (ref != null) ref.clear();
             publishEvent(CacheEventType.REMOVE, key, value);
@@ -1078,20 +1175,33 @@ public class BoundedLocalCache<K, V> implements Cache<K, V> {
 
     private void onTimerExpired(K key) {
         LocalCacheSegment<K, V> segment = segmentFor(key);
-        Node<K, V> node = segment.getNode(key);
-        if (node == null) return;
 
-        long now = System.currentTimeMillis();
-        if (isExpired(node, now)) {
-            V value = node.getValue();
-            if (segment.removeNode(key, node)) {
-                expireCount.increment();
+        // 直接获取写锁，避免读锁升级死锁
+        long stamp = segment.getLock().writeLock();
+        try {
+            Node<K, V> node = segment.getMap().get(key);
+            if (node == null) return;
+
+            long now = System.currentTimeMillis();
+            if (isExpired(node, now)) {
+                V value = node.getValue();
+                segment.getMap().remove(key);
                 currentSize.decrement();
+
+                // 从对应分区移除（新增）
+                if (useWindowCache && node.isInWindow()) {
+                    windowCache.remove(node);
+                } else if (mainPolicy != null &&
+                        (node.isInProbation() || node.isInProtected())) {
+                    mainPolicy.remove(node);
+                }
 
                 ManualReference<V> ref = node.getValueReference();
                 if (ref != null) ref.clear();
                 publishEvent(CacheEventType.EXPIRE, key, value);
             }
+        } finally {
+            segment.getLock().unlockWrite(stamp);
         }
     }
 
@@ -1129,49 +1239,60 @@ public class BoundedLocalCache<K, V> implements Cache<K, V> {
         }
     }
 
-    @Override
     public void invalidateAll() {
-        // 收集所有条目用于事件通知（在清理前）
-        if (enableEvents) {
-            List<CacheEvent<K, V>> events = new ArrayList<>();
-            long now = System.currentTimeMillis();
+        // 阶段1：只收集数据，不执行回调或清理（避免持有锁时执行外部代码）
+        List<CacheEvent<K, V>> events = new ArrayList<>();
+        List<Node<K, V>> nodesToClean = new ArrayList<>();
+        long now = System.currentTimeMillis();
 
-            stripedLock.lockAll();
+        // 关键修复：不要先获取 stripedLock！
+        // 直接遍历 segments，对每个 segment 加锁
+        for (LocalCacheSegment<K, V> segment : segments) {
+            long stamp = segment.getLock().writeLock();
             try {
-                for (LocalCacheSegment<K, V> segment : segments) {
-                    segment.getMap().forEach((k, node) -> {
-                        if (!isExpired(node, now) && !node.isValueCollected()) {
-                            V value = node.getValue();
-                            if (value != null) {
-                                events.add(CacheEvent.<K, V>builder()
-                                        .type(CacheEventType.REMOVE)
-                                        .key(k)
-                                        .value(value)
-                                        .build());
-                            }
+                Map<K, Node<K, V>> map = segment.getMap();
+                map.forEach((k, node) -> {
+                    if (!isExpired(node, now) && !node.isValueCollected()) {
+                        V value = node.getValue();
+                        if (value != null) {
+                            events.add(CacheEvent.<K, V>builder()
+                                    .type(CacheEventType.REMOVE)
+                                    .key(k)
+                                    .value(value)
+                                    .build());
                         }
-                    });
-                }
-            } finally {
-                stripedLock.unlockAll();
-            }
+                        nodesToClean.add(node);
+                    }
+                });
 
-            // 发布事件（批量）
-            events.forEach(e -> publishEvent(e.getType(), e.getKey(), e.getValue()));
+                int removedCount = map.size();
+                for (int i = 0; i < removedCount; i++) {
+                    currentSize.decrement();
+                }
+                map.clear();
+            } finally {
+                segment.getLock().unlockWrite(stamp);
+            }
         }
 
-        // 执行实际清理
-        for (LocalCacheSegment<K, V> segment : segments) {
-            segment.processSafelyWrite(map -> {
-                map.values().forEach(node -> {
-                    if (timerWheel != null) {
-                        synchronized (node) { timerWheel.cancel(node); }
-                    }
-                    ManualReference<V> ref = node.getValueReference();
-                    if (ref != null) ref.clear();
-                });
-                map.clear();
-            });
+        // 阶段2：锁外清理（避免死锁）
+        for (Node<K, V> node : nodesToClean) {
+            if (timerWheel != null) {
+                timerWheel.cancel(node);
+            }
+            ManualReference<V> ref = node.getValueReference();
+            if (ref != null) ref.clear();
+
+            if (useWindowCache && node.isInWindow()) {
+                windowCache.remove(node);
+            } else if (mainPolicy != null && (node.isInProbation() || node.isInProtected())) {
+                mainPolicy.remove(node);
+            }
+        }
+
+        // 阶段3：锁外发布事件
+        if (enableEvents) {
+            events.forEach(e -> publishEvent(e.getType(), e.getKey(), e.getValue()));
         }
     }
 
@@ -1227,29 +1348,35 @@ public class BoundedLocalCache<K, V> implements Cache<K, V> {
     }
 
     public void shutdown() {
-
-        if (writeBuffer != null) {
-            writeBuffer.shutdown();
+        // 1. 先停止所有后台线程，切断新任务来源
+        if (timerWheel != null) {
+            timerWheel.shutdown();
+        }
+        if (evictionScheduler != null) {
+            evictionScheduler.shutdown();
         }
 
-        // 等待事件处理完成（简单实现：休眠一段时间）
-        if (enableEvents) {
+        // 2. 关键修复：WriteBuffer 的关闭必须在独立线程中进行，避免和业务线程互相等待
+        if (writeBuffer != null) {
+            // 使用 Future 超时机制，防止无限阻塞
+            ExecutorService executor = Executors.newSingleThreadExecutor();
+            Future<?> future = executor.submit(writeBuffer::shutdown);
             try {
-                Thread.sleep(100);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
+                future.get(3, TimeUnit.SECONDS);  // 3秒超时强制返回
+            } catch (Exception e) {
+                System.err.println("[Shutdown] WriteBuffer 关闭超时，可能存在死锁");
+                future.cancel(true);
+            } finally {
+                executor.shutdownNow();
             }
         }
 
-        // 关键：等待异步RemovalProcessor完成
-        if (asyncRemovalProcessor != null) {
-            System.out.println("[Shutdown] 等待异步RemovalProcessor完成，已处理: " +
-                    asyncRemovalProcessor.getProcessedCount());
-            asyncRemovalProcessor.shutdown();
+        // 3. 等待后台线程释放锁
+        try {
+            Thread.sleep(100);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
         }
-
-        if (timerWheel != null) timerWheel.shutdown();
-        if (memorySensitive) cleanupSoftReferences();
     }
 
     // 添加统计接口
@@ -1273,5 +1400,23 @@ public class BoundedLocalCache<K, V> implements Cache<K, V> {
                     submitted, merged, flushed,
                     submitted == 0 ? 0 : 100.0 * merged / submitted);
         }
+    }
+
+    // 包级访问方法，仅供测试
+    Node<K, V> getNodeInternal(K key) {
+        LocalCacheSegment<K, V> segment = segmentFor(key);
+        return segment.getNode(key);
+    }
+
+    MainCachePolicy<K, V> getMainPolicy() {
+        return mainPolicy;
+    }
+
+    WindowCache<K, V> getWindowCache() {
+        return windowCache;
+    }
+
+    FrequencySketch<K> getFrequencySketch() {
+        return frequencySketch;
     }
 }

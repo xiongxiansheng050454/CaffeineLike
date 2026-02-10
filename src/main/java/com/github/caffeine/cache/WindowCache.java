@@ -43,16 +43,51 @@ public final class WindowCache<K, V> {
      * 并发安全：整个方法被写锁包裹，确保"检查-驱逐-添加"三步原子化
      */
     public void admit(Node<K, V> node) {
+        Node<K, V> victimToPromote = null;
         long stamp = lock.writeLock();
         try {
             // 严格容量控制：已满则先驱逐
             if (size.sum() >= capacity) {
-                evictToMainLocked();
+                // 只记录victim，不在锁内调用handler
+                victimToPromote = deque.removeFirst();
+                if (victimToPromote != null) {
+                    size.decrement();
+                    victimToPromote.setInWindow(false);
+                }
             }
 
             deque.add(node);
             size.increment();
             node.setInWindow(true);
+        } finally {
+            lock.unlockWrite(stamp);
+        }
+
+        // ===== 关键修复：在锁外调用晋升回调 =====
+        if (victimToPromote != null && promotionHandler != null) {
+            try {
+                promotionHandler.accept(victimToPromote);
+            } catch (Exception e) {
+                System.err.println("[WindowCache] Promotion failed for key: "
+                        + victimToPromote.getKey() + ", error: " + e.getMessage());
+            }
+        }
+    }
+
+    public void replace(Node<K, V> oldNode, Node<K, V> newNode) {
+        long stamp = lock.writeLock();
+        try {
+            // 移除旧节点（如果仍在 Window 中）
+            if (oldNode.isInWindow()) {
+                deque.remove(oldNode);
+                size.decrement();
+                oldNode.setInWindow(false);
+            }
+
+            // 添加新节点（remove 已腾出空间，不会触发驱逐回调）
+            deque.add(newNode);
+            size.increment();
+            newNode.setInWindow(true);
         } finally {
             lock.unlockWrite(stamp);
         }
@@ -94,32 +129,6 @@ public final class WindowCache<K, V> {
             }
         } finally {
             lock.unlockWrite(stamp);
-        }
-    }
-
-    /**
-     * 驱逐LRU节点到Main Cache（内部方法，需在写锁内调用）
-     *
-     * 注意：promotionHandler.accept() 在此处调用，若其抛出异常，
-     * 节点仍会被移出Window（避免内存泄漏），但可能丢失到Main区的链接
-     */
-    private void evictToMainLocked() {
-        Node<K, V> victim = deque.removeFirst();
-        if (victim != null) {
-            size.decrement();
-            victim.setInWindow(false);
-
-            // 触发晋升回调（进入TinyLFU主区）
-            if (promotionHandler != null) {
-                try {
-                    promotionHandler.accept(victim);
-                } catch (Exception e) {
-                    // 晋升失败不应影响WindowCache的完整性
-                    // 实际项目中应使用日志框架（如SLF4J）记录
-                    System.err.println("[WindowCache] Promotion failed for key: "
-                            + victim.getKey() + ", error: " + e.getMessage());
-                }
-            }
         }
     }
 

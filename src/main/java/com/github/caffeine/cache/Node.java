@@ -15,12 +15,17 @@ import jdk.internal.vm.annotation.Contended;
  */
 public class Node<K, V> implements AccessOrder<Node<K, V>>{
     private static final VarHandle VALUE_HANDLE;
+    private static final VarHandle QUEUE_TYPE_HANDLE;
 
     private final K key;
 
     // @Contended 确保 value 独占 64 字节缓存行，避免伪共享
     @Contended
     private volatile Object valueHolder;
+
+    @Contended
+    private volatile int queueType;  // 0=Window, 1=Probation, 2=Protected
+
 
     private final ReferenceStrength valueStrength;
     private final ManualReferenceQueue<V> refQueue;
@@ -49,6 +54,8 @@ public class Node<K, V> implements AccessOrder<Node<K, V>>{
         try {
             VALUE_HANDLE = MethodHandles.lookup()
                     .findVarHandle(Node.class, "valueHolder", Object.class);
+            QUEUE_TYPE_HANDLE = MethodHandles.lookup()
+                    .findVarHandle(Node.class, "queueType", int.class);
         } catch (Exception e) {
             throw new ExceptionInInitializerError(e);
         }
@@ -75,7 +82,21 @@ public class Node<K, V> implements AccessOrder<Node<K, V>>{
             VALUE_HANDLE.setRelease(this, ref);
             ref.setCleanupCallback(() -> this.expireAt = 0);
         }
+
+        this.queueType = QueueType.WINDOW.value();  // 默认进入 Window 区
     }
+
+    public int getQueueType() {
+        return (int) QUEUE_TYPE_HANDLE.getAcquire(this);
+    }
+
+    public void setQueueType(int type) {
+        QUEUE_TYPE_HANDLE.setRelease(this, type);
+    }
+
+    // 辅助方法
+    public boolean isInProbation() { return getQueueType() == QueueType.PROBATION.value(); }
+    public boolean isInProtected() { return getQueueType() == QueueType.PROTECTED.value(); }
 
     public ReferenceStrength getValueStrength() {
         return valueStrength;

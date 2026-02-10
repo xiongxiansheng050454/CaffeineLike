@@ -50,6 +50,12 @@ public final class AccessOrderDeque<K, V> {
         add(e);
     }
 
+    /** 查看头部不移除 - 用于 TinyLFU 比较 */
+    public Node<K, V> peekFirst() {
+        Node<K, V> next = dummy.getNextInAccessOrder();
+        return next == dummy ? null : next;
+    }
+
     public boolean isEmpty() {
         return dummy.getNextInAccessOrder() == dummy;
     }
