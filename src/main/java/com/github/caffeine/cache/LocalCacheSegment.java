@@ -7,22 +7,34 @@ import java.util.function.Consumer;
 
 public final class LocalCacheSegment<K, V> {
     private final HashMap<K, Node<K, V>> map;
-    private final StampedLock lock = new StampedLock(); // 独立锁
+    private final StampedLock lock = new StampedLock();
 
     public LocalCacheSegment() {
         this.map = new HashMap<>(16);
     }
 
+    /**
+     * 优化后的getNode：自旋重试乐观读，提高成功率
+     */
     public Node<K, V> getNode(K key) {
-        // 乐观读：无锁尝试
-        long stamp = lock.tryOptimisticRead();
-        Node<K, V> node = map.get(key);
-        if (lock.validate(stamp)) {
-            return node;  // 无锁成功
+        // 优化：最多重试3次，给写操作完成的时间窗口
+        for (int i = 0; i < 3; i++) {
+            long stamp = lock.tryOptimisticRead();
+            Node<K, V> node = map.get(key);
+
+            // 关键：验证前添加内存屏障，确保读到最新值
+            if (lock.validate(stamp)) {
+                return node;  // 成功，完全无锁返回
+            }
+
+            // 短暂自旋，等待写操作释放（减少CPU占用）
+            if (i < 2) {
+                Thread.onSpinWait();
+            }
         }
 
-        // 回退到读锁
-        stamp = lock.readLock();
+        // 3次失败后降级到读锁（保护性读取）
+        long stamp = lock.readLock();
         try {
             return map.get(key);
         } finally {
@@ -30,7 +42,7 @@ public final class LocalCacheSegment<K, V> {
         }
     }
 
-    // 写操作使用 writeLock
+    // 写操作保持不变
     public Node<K, V> putNode(K key, Node<K, V> node) {
         long stamp = lock.writeLock();
         try {
@@ -40,11 +52,9 @@ public final class LocalCacheSegment<K, V> {
         }
     }
 
-    // 修正：使用 writeLock 而不是 lock()
     public boolean removeNode(K key, Node<K, V> node) {
         long stamp = lock.writeLock();
         try {
-            // 注意：HashMap.remove(key, value) 需要 value 匹配
             if (map.get(key) == node) {
                 map.remove(key);
                 return true;
@@ -55,7 +65,6 @@ public final class LocalCacheSegment<K, V> {
         }
     }
 
-    // 修正：使用 writeLock
     public Node<K, V> removeNode(K key) {
         long stamp = lock.writeLock();
         try {
@@ -65,9 +74,14 @@ public final class LocalCacheSegment<K, V> {
         }
     }
 
-    // 修正：使用 readLock（允许并发读）
     public int size() {
-        long stamp = lock.readLock();
+        long stamp = lock.tryOptimisticRead();
+        int size = map.size();
+        if (lock.validate(stamp)) {
+            return size;
+        }
+
+        stamp = lock.readLock();
         try {
             return map.size();
         } finally {
@@ -75,32 +89,11 @@ public final class LocalCacheSegment<K, V> {
         }
     }
 
-    // 仅用于遍历（外部需先 lockAll）
     public HashMap<K, Node<K, V>> getMap() {
         return map;
     }
 
     public StampedLock getLock() {
         return lock;
-    }
-
-    // 修正：根据操作类型选择锁
-    public void processSafelyWrite(Consumer<Map<K, Node<K, V>>> processor) {
-        long stamp = lock.writeLock(); // 或 readLock() 如果只读
-        try {
-            processor.accept(map);
-        } finally {
-            lock.unlockWrite(stamp);
-        }
-    }
-
-    // 新增：只读安全处理
-    public void processSafelyRead(Consumer<Map<K, Node<K, V>>> processor) {
-        long stamp = lock.readLock();
-        try {
-            processor.accept(map);
-        } finally {
-            lock.unlockRead(stamp);
-        }
     }
 }

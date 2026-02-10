@@ -4,7 +4,7 @@ import java.util.concurrent.atomic.LongAdder;
 import java.util.concurrent.locks.StampedLock;
 
 /**
- * Main Cache 策略管理器 - 修复版（避免 StampedLock 重入）
+ * Main Cache 策略管理器 - 优化版（采样访问）
  */
 public final class MainCachePolicy<K, V> {
     private final AccessOrderDeque<K, V> probationDeque;
@@ -26,18 +26,12 @@ public final class MainCachePolicy<K, V> {
         this.probationMaximum = mainCacheMaximum - this.protectedMaximum;
     }
 
-    /**
-     * 将节点从 Window 移入 Probation
-     * @return 如果因容量限制需要驱逐节点，返回该节点；否则返回 null
-     */
     public Node<K, V> admitToProbation(Node<K, V> node) {
         long stamp = lock.writeLock();
         try {
-            // 如果 Probation 已满，先尝试将 LRU 降级到 Protected
             if (probationWeightedSize.sum() >= probationMaximum) {
                 Node<K, V> lru = probationDeque.peekFirst();
                 if (lru != null) {
-                    // 如果 Protected 未满，降级到 Protected
                     if (protectedWeightedSize.sum() < protectedMaximum) {
                         probationDeque.remove(lru);
                         probationWeightedSize.decrement();
@@ -46,15 +40,9 @@ public final class MainCachePolicy<K, V> {
                         lru.setQueueType(QueueType.PROTECTED.value());
                         protectedWeightedSize.increment();
                     } else {
-                        // Protected 也满，才需要真正驱逐
                         Node<K, V> victim = evictFromProbationUnsafe();
                         if (victim != null) {
                             victim.setQueueType(-1);
-                            // 注意：这里只返回victim，不执行实际删除
-                            // 让上层调用者（doPutInternal）在锁外处理
-
-                            // 添加新节点前先处理驱逐逻辑会导致计数错误，
-                            // 所以先添加新节点，再返回victim
                             probationDeque.add(node);
                             node.setQueueType(QueueType.PROBATION.value());
                             probationWeightedSize.increment();
@@ -73,10 +61,6 @@ public final class MainCachePolicy<K, V> {
         }
     }
 
-    /**
-     * 访问 Probation 区节点：尝试晋升到 Protected
-     * 修复：避免在 tryPromoteToProtected 内部嵌套获取写锁
-     */
     public boolean tryPromoteToProtected(Node<K, V> node, int frequency,
                                          int probationHeadFreq) {
         long stamp = lock.writeLock();
@@ -88,7 +72,6 @@ public final class MainCachePolicy<K, V> {
                     probationDeque.moveToTail(node);
                     return false;
                 }
-                // 降级操作，使用 unsafe 版本
                 demoteProtectedToProbationUnsafe();
             }
 
@@ -106,8 +89,22 @@ public final class MainCachePolicy<K, V> {
     }
 
     /**
-     * 从 Probation 驱逐（当 Main Cache 满时）- 公共方法，带锁
+     * 优化：采样模式的Protected访问（非阻塞尝试）
      */
+    public void onProtectedAccessSampled(Node<K, V> node) {
+        // 尝试非阻塞获取锁
+        long stamp = lock.tryWriteLock();
+        if (stamp == 0) return; // 放弃本次LRU更新
+
+        try {
+            if (node.isInProtected()) {
+                protectedDeque.moveToTail(node);
+            }
+        } finally {
+            lock.unlockWrite(stamp);
+        }
+    }
+
     public Node<K, V> evictFromProbation() {
         long stamp = lock.writeLock();
         try {
@@ -117,9 +114,6 @@ public final class MainCachePolicy<K, V> {
         }
     }
 
-    /**
-     * 内部驱逐逻辑 - 假设已持有写锁
-     */
     private Node<K, V> evictFromProbationUnsafe() {
         Node<K, V> victim = probationDeque.removeFirst();
         if (victim != null) {
@@ -129,9 +123,6 @@ public final class MainCachePolicy<K, V> {
         return victim;
     }
 
-    /**
-     * 降级 Protected 尾部到 Probation 头部 - 假设已持有写锁
-     */
     private void demoteProtectedToProbationUnsafe() {
         Node<K, V> victim = protectedDeque.removeFirst();
         if (victim != null) {
@@ -140,18 +131,6 @@ public final class MainCachePolicy<K, V> {
             probationDeque.add(victim);
             victim.setQueueType(QueueType.PROBATION.value());
             probationWeightedSize.increment();
-        }
-    }
-
-    // 其他方法保持不变...
-    public void onProtectedAccess(Node<K, V> node) {
-        long stamp = lock.writeLock();
-        try {
-            if (node.isInProtected()) {
-                protectedDeque.moveToTail(node);
-            }
-        } finally {
-            lock.unlockWrite(stamp);
         }
     }
 

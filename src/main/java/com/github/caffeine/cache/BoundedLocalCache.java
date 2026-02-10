@@ -76,8 +76,12 @@ public class BoundedLocalCache<K, V> implements Cache<K, V> {
     private final FrequencySketch<K> frequencySketch;
     private final boolean evictsBySize;
 
-    // 新增：访问计数（用于触发驱逐检查）
-    private final LongAdder readCount = new LongAdder();
+    private final ThreadLocal<int[]> readSampler = ThreadLocal.withInitial(() -> {
+        // 随机初始偏移，避免所有线程同时触发采样
+        int offset = ThreadLocalRandom.current().nextInt(64);
+        return new int[]{offset};
+    });
+
     private static final int EVICTION_THRESHOLD = 100; // 每100次读检查一次驱逐
 
     // 新增：异步驱逐调度器
@@ -723,20 +727,13 @@ public class BoundedLocalCache<K, V> implements Cache<K, V> {
         long now = cachedTime;
 
         if (bufferingEnabled) {
-            // 第一重检查：是否是待删除状态
             if (writeBuffer.isPendingDelete(key)) {
                 return null;
             }
-
-            // 查询待写入的值（如果存在且未过期）
             V pending = writeBuffer.getPending(key, now);
             if (pending != null) {
                 return pending;
             }
-
-            // 关键修复：pending 为 null 可能是因为：
-            // 1. 缓冲中没有该key  2. 该key是待删除状态（value=null）
-            // 由于上面的 isPendingDelete 可能有竞态，这里需要二次确认
             if (writeBuffer.isPendingDelete(key)) {
                 return null;
             }
@@ -750,25 +747,30 @@ public class BoundedLocalCache<K, V> implements Cache<K, V> {
             return null;
         }
 
-        // 处理访问后的队列迁移
-        int queueType = node.getQueueType();
+        // ===== 优化1：采样频率统计（降低64倍竞争） =====
+        int[] sampler = readSampler.get();
+        int count = sampler[0]++;
+        boolean shouldSample = (count & 63) == 0;  // 每64次采样一次
 
-        if (queueType == QueueType.WINDOW.value()) {
-            // Window 区访问：已在 WindowCache.onAccess 中处理 LRU
-            windowCache.onAccess(node);
-        }
-        else if (queueType == QueueType.PROBATION.value()) {
-            // Probation 区访问：尝试晋升到 Protected
-            int freq = frequencySketch.frequency(key);
-            Node<K, V> probationHead = mainPolicy.peekProbationHead();
-            int headFreq = (probationHead != null) ?
-                    frequencySketch.frequency(probationHead.getKey()) : 0;
+        if (shouldSample && evictsBySize) {
+            frequencySketch.increment(key);
 
-            mainPolicy.tryPromoteToProtected(node, freq, headFreq);
-        }
-        else if (queueType == QueueType.PROTECTED.value()) {
-            // Protected 区访问：LRU 维护
-            mainPolicy.onProtectedAccess(node);
+            // 采样时才检查Window位置（降低锁竞争）
+            if (useWindowCache && node.isInWindow()) {
+                windowCache.onAccessSampled(node);
+            }
+
+            // 采样时才尝试晋升（Probation->Protected）
+            int queueType = node.getQueueType();
+            if (queueType == QueueType.PROBATION.value()) {
+                int freq = frequencySketch.frequency(key);
+                Node<K, V> probationHead = mainPolicy.peekProbationHead();
+                int headFreq = (probationHead != null) ?
+                        frequencySketch.frequency(probationHead.getKey()) : 0;
+                mainPolicy.tryPromoteToProtected(node, freq, headFreq);
+            } else if (queueType == QueueType.PROTECTED.value()) {
+                mainPolicy.onProtectedAccessSampled(node);
+            }
         }
 
         // 检查引用是否被清理（无锁读）
@@ -779,13 +781,13 @@ public class BoundedLocalCache<K, V> implements Cache<K, V> {
             return null;
         }
 
-        // 使用实时时间检查过期（cachedTime 可能有 100ms 误差）
+        // 使用实时时间检查过期
         long realNow = System.currentTimeMillis();
         if (isExpired(node, realNow)) {
             if (segment.removeNode(key, node)) {
                 expireCount.increment();
                 if (timerWheel != null) {
-                    synchronized (node) {  // 时间轮操作仍需同步
+                    synchronized (node) {
                         timerWheel.cancel(node);
                     }
                 }
@@ -794,28 +796,12 @@ public class BoundedLocalCache<K, V> implements Cache<K, V> {
             return null;
         }
 
-        // 处理 expireAfterAccess：使用 VarHandle lazySet 更新时间戳
-        if (builder.expiresAfterAccess()) {
+        // 采样时才更新访问时间（降低内存屏障开销）
+        if (shouldSample && builder.expiresAfterAccess()) {
             long newExpireAt = realNow + TimeUnit.NANOSECONDS.toMillis(builder.expireAfterAccessNanos);
-            node.setAccessTime(realNow);        // setRelease
-            node.setExpireAt(newExpireAt);  // setRelease
+            node.setAccessTime(realNow);
+            node.setExpireAt(newExpireAt);
             reschedule(node, newExpireAt);
-        }
-
-        // 关键：记录访问频率（W-TinyLFU核心）
-        if (evictsBySize) {
-            frequencySketch.increment(key);
-            readCount.increment();
-
-            // 新增：处理Window区的访问重排
-            if (useWindowCache && node.isInWindow()) {
-                windowCache.onAccess(node);
-            }
-
-            // 每 64 次访问触发一次异步扫描
-            if ((readCount.sum() & 63) == 0) {
-                triggerSamplingEviction();
-            }
         }
 
         hitCount.increment();

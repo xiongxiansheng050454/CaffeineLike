@@ -50,6 +50,17 @@ public final class AccessOrderDeque<K, V> {
         add(e);
     }
 
+    // 新增：查看尾部（MRU）节点
+    public Node<K, V> peekLast() {
+        Node<K, V> prev = dummy.getPreviousInAccessOrder();
+        return prev == dummy ? null : prev;
+    }
+
+    // 关键修正：提供给 WindowCache 使用的辅助方法
+    boolean isTail(Node<K, V> node) {
+        return node.getNextInAccessOrder() == dummy;
+    }
+
     /** 查看头部不移除 - 用于 TinyLFU 比较 */
     public Node<K, V> peekFirst() {
         Node<K, V> next = dummy.getNextInAccessOrder();
