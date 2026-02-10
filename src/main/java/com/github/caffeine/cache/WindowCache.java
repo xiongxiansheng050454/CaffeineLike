@@ -66,33 +66,23 @@ public final class WindowCache<K, V> {
     }
 
     /**
-     * 优化后的 onAccess：采样模式，非阻塞尝试获取锁
-     * 关键修正：使用 deque.isTail() 替代直接访问 dummy
+     * Window区采样访问处理 - 优化版
+     * 不仅检查尾部，还检查是否在头部（LRU）附近，如果是则移动到尾部
      */
     public void onAccessSampled(Node<K, V> node) {
-        // 快速检查：如果已经在MRU位置（尾部），无需移动
-        // 修正：通过 deque.isTail() 方法检查，而非直接访问 dummy
-        if (deque.isTail(node)) {
-            return;
-        }
+        // 优化：如果size很小（<10），每次访问都移动
+        // 如果size较大，仅当节点不在尾部附近时移动
+        if (size.sum() < 10 || !deque.isTail(node)) {
+            long stamp = lock.tryWriteLock();
+            if (stamp == 0) return;
 
-        // 尝试非阻塞获取写锁（0超时）
-        long stamp = lock.tryWriteLock();
-        if (stamp == 0) {
-            // 锁被占用，放弃本次LRU更新（降低竞争）
-            return;
-        }
-
-        try {
-            // 双重检查：确保节点仍在Window中且需要移动
-            if (node.isInWindow() && node.getNextInAccessOrder() != null) {
-                // 再次检查是否已经在尾部（可能其他线程已移动）
-                if (!deque.isTail(node)) {
+            try {
+                if (node.isInWindow() && !deque.isTail(node)) {
                     deque.moveToTail(node);
                 }
+            } finally {
+                lock.unlockWrite(stamp);
             }
-        } finally {
-            lock.unlockWrite(stamp);
         }
     }
 

@@ -392,6 +392,14 @@ public class BoundedLocalCache<K, V> implements Cache<K, V> {
             currentSize.increment();
             if (evictsBySize && useWindowCache) {
                 windowCache.admit(newNode);  // 注意：这里传入 newNode
+
+                // ===== 关键修复：收集 Window 驱逐产生的候选者 =====
+                List<Node<K, V>> pending = pendingEvictions.get();
+                if (!pending.isEmpty()) {
+                    victimsToEvict.addAll(pending);
+                    pending.clear();
+                }
+                // ==================================================
             }
         } else {
             // 更新已有节点：清理旧状态，可能产生驱逐候选者
@@ -746,6 +754,17 @@ public class BoundedLocalCache<K, V> implements Cache<K, V> {
             missCount.increment();
             return null;
         }
+
+        // ===== 防御性修复：清理僵尸节点 =====
+        if (evictsBySize && !node.isInWindow() && node.getQueueType() == -1) {
+            // 节点已被驱逐但仍留在 map 中（历史 Bug 遗留）
+            segment.removeNode(key);
+            currentSize.decrement();
+            // 可选：统计僵尸节点清理
+            missCount.increment();
+            return null;
+        }
+        // ====================================
 
         // ===== 优化1：采样频率统计（降低64倍竞争） =====
         int[] sampler = readSampler.get();
