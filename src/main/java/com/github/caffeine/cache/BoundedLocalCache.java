@@ -100,6 +100,10 @@ public class BoundedLocalCache<K, V> implements Cache<K, V> {
     @Contended
     private final LongAdder evictionCount = new LongAdder();
 
+    // 在现有字段附近添加（frequencySketch附近）
+    private final WindowCache<K, V> windowCache;
+    private final boolean useWindowCache; // 是否启用W-TinyLFU模式
+
     @SuppressWarnings("unchecked")
     public BoundedLocalCache(Caffeine<K, V> builder) {
         this.builder = builder;
@@ -226,6 +230,15 @@ public class BoundedLocalCache<K, V> implements Cache<K, V> {
                 ? new HierarchicalTimerWheel<>(this::onTimerExpired)
                 : null;
 
+        // 初始化Window Cache（仅当启用size限制时）
+        if (evictsBySize) {
+            this.useWindowCache = true;
+            this.windowCache = new WindowCache<>(builder.getMaximumSize(), this::promoteToMain);
+        } else {
+            this.useWindowCache = false;
+            this.windowCache = null;
+        }
+
         // 关键：确保维护线程启动（合并引用队列+内存检查）
         if (usesReferences) {
             startMaintenanceThread();
@@ -241,6 +254,22 @@ public class BoundedLocalCache<K, V> implements Cache<K, V> {
             }, "cache-time-ticker");
             timeTicker.setDaemon(true);
             timeTicker.start();
+        }
+    }
+
+    /**
+     * Window区节点晋升到Main区的回调
+     * 简化版：直接放入主存储（完整版应经过TinyLFU准入判断）
+     */
+    private void promoteToMain(Node<K, V> node) {
+        if (!evictsBySize) return;
+
+        // 不获取锁，直接标记（安全：node已从Window移除，即使被替换也无影响）
+        node.setInWindow(false);
+
+        // 触发异步驱逐检查（如果Main区也满了）
+        if (asyncEvictionEnabled) {
+            checkEvictionAsync();
         }
     }
 
@@ -350,10 +379,19 @@ public class BoundedLocalCache<K, V> implements Cache<K, V> {
             }
         }
 
-        // ===== 关键修复：触发同步驱逐检查 =====
-        // 当使用 WriteBuffer 时，此方法由后台线程调用，需要检查容量边界
+        // 新代码：使用Window Cache准入
         if (evictsBySize) {
-            ensureSizeBound();
+            if (oldNode == null && useWindowCache) {
+                // 新节点：进入Window区（而非直接进Main区）
+                windowCache.admit(newNode);
+            } else {
+                // 更新已有节点：检查Window区访问
+                if (useWindowCache && newNode.isInWindow()) {
+                    windowCache.onAccess(newNode);
+                }
+                // 触发驱逐检查
+                ensureSizeBound();
+            }
         }
     }
 
@@ -671,6 +709,11 @@ public class BoundedLocalCache<K, V> implements Cache<K, V> {
         if (evictsBySize) {
             frequencySketch.increment(key);
             readCount.increment();
+
+            // 新增：处理Window区的访问重排
+            if (useWindowCache && node.isInWindow()) {
+                windowCache.onAccess(node);
+            }
 
             // 每 64 次访问触发一次异步扫描
             if ((readCount.sum() & 63) == 0) {
@@ -1022,6 +1065,10 @@ public class BoundedLocalCache<K, V> implements Cache<K, V> {
                 synchronized (node) {
                     timerWheel.cancel(node);
                 }
+            }
+            // 如果在Window区，先移除
+            if (useWindowCache && node.isInWindow()) {
+                windowCache.remove(node);
             }
             ManualReference<V> ref = node.getValueReference();
             if (ref != null) ref.clear();

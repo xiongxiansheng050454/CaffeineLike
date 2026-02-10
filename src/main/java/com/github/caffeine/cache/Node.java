@@ -13,7 +13,7 @@ import jdk.internal.vm.annotation.Contended;
  * 增强的 Node，支持 VarHandle 无锁读写
  * 参考 Caffeine 的 Node 设计（AddValue.java + IntermittentNull.java）
  */
-public class Node<K, V> {
+public class Node<K, V> implements AccessOrder<Node<K, V>>{
     private static final VarHandle VALUE_HANDLE;
 
     private final K key;
@@ -37,6 +37,13 @@ public class Node<K, V> {
     // 时间轮链表指针
     private Node<K, V> prevInTimerWheel;
     private Node<K, V> nextInTimerWheel;
+
+    @Contended
+    private volatile boolean inWindow;  // 标记是否在Window区
+
+    // AccessOrder链表指针（与TimerWheel指针独立）
+    private Node<K, V> prevInAccessOrder;
+    private Node<K, V> nextInAccessOrder;
 
     static {
         try {
@@ -202,4 +209,13 @@ public class Node<K, V> {
         this.prevInTimerWheel = null;
         this.nextInTimerWheel = null;
     }
+
+    public boolean isInWindow() { return inWindow; }
+    public void setInWindow(boolean inWindow) { this.inWindow = inWindow; }
+
+    @Override public Node<K, V> getPreviousInAccessOrder() { return prevInAccessOrder; }
+    @Override public void setPreviousInAccessOrder(Node<K, V> prev) { this.prevInAccessOrder = prev; }
+
+    @Override public Node<K, V> getNextInAccessOrder() { return nextInAccessOrder; }
+    @Override public void setNextInAccessOrder(Node<K, V> next) { this.nextInAccessOrder = next; }
 }
